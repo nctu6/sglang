@@ -933,7 +933,7 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
+                if self.speculative_algorithm in ("STANDALONE", "PEARL"):
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
@@ -1952,11 +1952,14 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
-            if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "PEARL"):
+            if (
+                self.speculative_algorithm in ("STANDALONE", "PEARL")
+                and self.enable_dp_attention
+            ):
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
-                    "Currently standalone speculative decoding does not support dp attention."
+                    "Currently standalone/pearl speculative decoding does not support dp attention."
                 )
 
             if self.max_running_requests is None:
@@ -1965,21 +1968,27 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            if (
-                self.speculative_algorithm == "EAGLE"
-                and envs.SGLANG_ENABLE_SPEC_V2.get()
-            ):
-                self.disable_overlap_schedule = False
-                logger.warning(
-                    "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
-                )
-
-            if not envs.SGLANG_ENABLE_SPEC_V2.get():
+            if self.speculative_algorithm == "EAGLE":
+                if envs.SGLANG_ENABLE_SPEC_V2.get():
+                    self.disable_overlap_schedule = False
+                    logger.warning(
+                        "Beta spec is enabled for eagle speculative decoding and overlap schedule is turned on."
+                    )
+                else:
+                    self.disable_overlap_schedule = True
+                    logger.warning(
+                        "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
+                        "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
+                    )
+            else:
                 self.disable_overlap_schedule = True
-                logger.warning(
-                    "Overlap scheduler is disabled because of using eagle3 or standalone speculative decoding."
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler."
-                )
+
+            if self.speculative_algorithm == "PEARL":
+                if not self.disable_cuda_graph:
+                    self.disable_cuda_graph = True
+                    logger.warning(
+                        "CUDA graphs are disabled for PEARL speculative decoding."
+                    )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
@@ -1989,37 +1998,53 @@ class ServerArgs:
                 )
 
             model_arch = self.get_model_config().hf_config.architectures[0]
-            if model_arch in [
-                "DeepseekV32ForCausalLM",
-                "DeepseekV3ForCausalLM",
-                "Glm4MoeForCausalLM",
-                "BailingMoeForCausalLM",
-                "BailingMoeV2ForCausalLM",
-                "MistralLarge3ForCausalLM",
-                "PixtralForConditionalGeneration",
-            ]:
-                if self.speculative_draft_model_path is None:
-                    self.speculative_draft_model_path = self.model_path
-                    self.speculative_draft_model_revision = self.revision
-                else:
-                    if model_arch not in [
-                        "MistralLarge3ForCausalLM",
-                        "PixtralForConditionalGeneration",
-                    ]:
-                        logger.warning(
-                            "DeepSeek MTP does not require setting speculative_draft_model_path."
-                        )
-
-            if self.speculative_num_steps is None:
-                assert (
-                    self.speculative_eagle_topk is None
-                    and self.speculative_num_draft_tokens is None
+            if self.speculative_algorithm != "PEARL":
+                if model_arch in [
+                    "DeepseekV32ForCausalLM",
+                    "DeepseekV3ForCausalLM",
+                    "Glm4MoeForCausalLM",
+                    "BailingMoeForCausalLM",
+                    "BailingMoeV2ForCausalLM",
+                    "MistralLarge3ForCausalLM",
+                    "PixtralForConditionalGeneration",
+                ]:
+                    if self.speculative_draft_model_path is None:
+                        self.speculative_draft_model_path = self.model_path
+                        self.speculative_draft_model_revision = self.revision
+                    else:
+                        if model_arch not in [
+                            "MistralLarge3ForCausalLM",
+                            "PixtralForConditionalGeneration",
+                        ]:
+                            logger.warning(
+                                "DeepSeek MTP does not require setting speculative_draft_model_path."
+                            )
+            elif self.speculative_draft_model_path is None:
+                self.speculative_draft_model_path = self.model_path
+                self.speculative_draft_model_revision = self.revision
+                logger.warning(
+                    "PEARL draft model path is not set; falling back to the target model."
                 )
-                (
-                    self.speculative_num_steps,
-                    self.speculative_eagle_topk,
-                    self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(self)
+
+            if self.speculative_algorithm != "PEARL":
+                if self.speculative_num_steps is None:
+                    assert (
+                        self.speculative_eagle_topk is None
+                        and self.speculative_num_draft_tokens is None
+                    )
+                    (
+                        self.speculative_num_steps,
+                        self.speculative_eagle_topk,
+                        self.speculative_num_draft_tokens,
+                    ) = auto_choose_speculative_params(self)
+            else:
+                if self.speculative_num_steps is None:
+                    self.speculative_num_steps = 4
+                    logger.warning(
+                        "speculative_num_steps is not set for PEARL; defaulting to 4."
+                    )
+                if self.speculative_num_draft_tokens is None:
+                    self.speculative_num_draft_tokens = self.speculative_num_steps
 
             if (
                 self.attention_backend == "trtllm_mha"
@@ -2031,23 +2056,35 @@ class ServerArgs:
                         "trtllm_mha backend only supports topk = 1 for speculative decoding."
                     )
 
-            if (
-                self.speculative_eagle_topk == 1
-                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
-            ):
+            if self.speculative_algorithm != "PEARL":
+                if (
+                    self.speculative_eagle_topk == 1
+                    and self.speculative_num_draft_tokens
+                    != self.speculative_num_steps + 1
+                ):
+                    logger.warning(
+                        "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
+                    )
+                    self.speculative_num_draft_tokens = (
+                        self.speculative_num_steps + 1
+                    )
+            elif self.speculative_num_draft_tokens != self.speculative_num_steps:
                 logger.warning(
-                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
+                    "PEARL uses speculative_num_steps tokens; aligning speculative_num_draft_tokens."
                 )
-                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+                self.speculative_num_draft_tokens = self.speculative_num_steps
 
-            if (
-                self.speculative_eagle_topk > 1
-                and self.page_size > 1
-                and self.attention_backend not in ["flashinfer", "fa3"]
-            ):
-                raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
-                )
+            if self.speculative_algorithm != "PEARL":
+                if (
+                    self.speculative_eagle_topk > 1
+                    and self.page_size > 1
+                    and self.attention_backend not in ["flashinfer", "fa3"]
+                ):
+                    raise ValueError(
+                        "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                    )
+            elif self.page_size != 1:
+                raise ValueError("PEARL currently requires page_size == 1.")
 
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
