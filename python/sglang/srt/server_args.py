@@ -1953,10 +1953,7 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "PEARL"):
-            if (
-                self.speculative_algorithm in ("STANDALONE", "PEARL")
-                and self.enable_dp_attention
-            ):
+            if self.speculative_algorithm in ("STANDALONE", "PEARL") and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone/pearl speculative decoding does not support dp attention."
@@ -3367,7 +3364,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "PEARL", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
