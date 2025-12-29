@@ -46,6 +46,7 @@ class PearlWorker:
             server_args.speculative_algorithm
         )
         self.device = target_worker.model_runner.device
+        self.target_vocab_size = target_worker.model_runner.model_config.vocab_size
 
         # Share allocator and request pool with the target worker to align slots.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -69,6 +70,9 @@ class PearlWorker:
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
+
+        self.model_runner = self.draft_worker.model_runner
+        self.model_config = self.draft_worker.model_config
 
     def clear_cache_pool(self):
         # Allocator is shared with target worker.
@@ -119,6 +123,7 @@ class PearlWorker:
 
         base_seq_lens = batch.seq_lens.clone()
         base_seq_lens_cpu = batch.seq_lens_cpu.clone()
+        base_seq_lens_sum = batch.seq_lens_sum
 
         if self.page_size != 1:
             raise ValueError("PEARL currently requires page_size == 1")
@@ -134,20 +139,28 @@ class PearlWorker:
             batch.input_ids = torch.tensor(
                 current_tokens, dtype=torch.int64, device=self.device
             )
-            batch.seq_lens = base_seq_lens + step
-            batch.seq_lens_cpu = base_seq_lens_cpu + step
+            batch.seq_lens = base_seq_lens + step + 1
+            batch.seq_lens_cpu = base_seq_lens_cpu + step + 1
+            batch.seq_lens_sum = int(batch.seq_lens.sum().item())
             batch.out_cache_loc = draft_cache_loc[:, step]
 
             model_worker_batch = batch.get_model_worker_batch()
             batch_result = self.draft_worker.forward_batch_generation(model_worker_batch)
             logits_output = batch_result.logits_output
             next_tokens = torch.argmax(logits_output.next_token_logits, dim=-1)
+            if self.target_vocab_size:
+                next_tokens = torch.where(
+                    next_tokens < self.target_vocab_size,
+                    next_tokens,
+                    torch.zeros_like(next_tokens),
+                )
 
             draft_tokens.append(next_tokens)
             current_tokens = next_tokens.tolist()
 
         batch.seq_lens = base_seq_lens
         batch.seq_lens_cpu = base_seq_lens_cpu
+        batch.seq_lens_sum = base_seq_lens_sum
         return torch.stack(draft_tokens, dim=1)
 
     def _build_positions(self, batch: ScheduleBatch) -> torch.Tensor:
@@ -159,14 +172,25 @@ class PearlWorker:
         return positions
 
     def _build_custom_mask(self, batch: ScheduleBatch) -> torch.Tensor:
-        mask = torch.tril(
+        masks = []
+        draft_mask = torch.tril(
             torch.ones(
                 (self.speculative_num_draft_tokens, self.speculative_num_draft_tokens),
                 dtype=torch.bool,
                 device=self.device,
             )
         )
-        return mask.repeat(batch.batch_size(), 1, 1).reshape(-1)
+        for seq_len in batch.seq_lens_cpu.tolist():
+            prefix_len = max(int(seq_len), 0)
+            prefix_mask = torch.ones(
+                (self.speculative_num_draft_tokens, prefix_len),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            masks.append(torch.cat([prefix_mask, draft_mask], dim=1).reshape(-1))
+        if not masks:
+            return torch.empty((0,), dtype=torch.bool, device=self.device)
+        return torch.cat(masks, dim=0)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -183,6 +207,12 @@ class PearlWorker:
         batch.spec_info = None
         out_cache_loc = self._allocate_draft_slots(batch)
         draft_tokens = self._run_draft(batch, out_cache_loc)
+        if self.target_vocab_size:
+            draft_tokens = torch.where(
+                draft_tokens < self.target_vocab_size,
+                draft_tokens,
+                torch.zeros_like(draft_tokens),
+            )
 
         positions = self._build_positions(batch)
         custom_mask = self._build_custom_mask(batch)
@@ -197,6 +227,7 @@ class PearlWorker:
             custom_mask,
             positions,
             self.speculative_num_draft_tokens,
+            self.target_vocab_size,
         )
         batch.spec_info = spec_info
 

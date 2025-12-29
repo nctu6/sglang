@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -34,12 +35,14 @@ class PearlVerifyInput(SpecInput):
         custom_mask: torch.Tensor,
         positions: torch.Tensor,
         draft_token_num: int,
+        vocab_size: int,
     ):
         super().__init__(SpecInputType.PEARL_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = custom_mask
         self.positions = positions
         self.draft_token_num = draft_token_num
+        self.vocab_size = vocab_size
         self.device = draft_token.device
         self.accepted_indices: Optional[torch.Tensor] = None
         self.accept_length: Optional[torch.Tensor] = None
@@ -91,6 +94,39 @@ class PearlVerifyInput(SpecInput):
             next_power_of_2(bs),
         )
 
+    def generate_attn_arg_prefill(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        req_to_token: torch.Tensor,
+    ):
+        bs = len(req_pool_indices)
+
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+
+        self.qo_indptr = (
+            torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
+            * self.draft_token_num
+        )
+
+        kv_indices = torch.empty(
+            cum_kv_seq_len[-1], dtype=torch.int32, device=self.device
+        )
+
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -120,10 +156,16 @@ class PearlVerifyInput(SpecInput):
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
             )
 
+        if self.vocab_size:
+            self.draft_token = torch.clamp(
+                self.draft_token, min=0, max=self.vocab_size - 1
+            )
         draft_tokens = self.draft_token.view(bs, self.draft_token_num)
-        temperatures = sampling_info.temperatures.repeat_interleave(
-            self.draft_token_num
-        ).clamp(min=1e-5)
+        temperatures = (
+            sampling_info.temperatures.repeat_interleave(self.draft_token_num)
+            .clamp(min=1e-5)
+            .unsqueeze(1)
+        )
         scaled_logits = logits_output.next_token_logits / temperatures
         probs = torch.softmax(scaled_logits, dim=-1)
         target_prob = probs.gather(1, self.draft_token.unsqueeze(1)).squeeze(1)
@@ -219,6 +261,20 @@ class PearlVerifyInput(SpecInput):
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
         return logits_output, self.verified_id, num_accepted_tokens, accept_length_list
+
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.accept_length is not None:
+            self.accept_length = self.accept_length[new_indices]
+
+    def merge_batch(self, spec_info: "PearlVerifyInput"):
+        if spec_info is None:
+            return
+        if self.accept_length is None:
+            self.accept_length = spec_info.accept_length
+        elif spec_info.accept_length is not None:
+            self.accept_length = torch.cat(
+                [self.accept_length, spec_info.accept_length], dim=0
+            )
 
     def _free_cache(
         self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor

@@ -317,12 +317,6 @@ register_speculative_algorithm(
 )
 
 register_speculative_algorithm(
-    "PEARL",
-    worker_cls=_create_standalone_worker,
-    flags=("STANDALONE",),
-)
-
-register_speculative_algorithm(
     "NGRAM",
     worker_cls=_create_ngram_worker,
     flags=("NGRAM",),
