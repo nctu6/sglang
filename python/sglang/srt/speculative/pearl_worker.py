@@ -23,8 +23,10 @@ from sglang.srt.speculative.pearl_info import PearlVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
 from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+_PEARL_DEBUG = get_bool_env_var("SGLANG_PEARL_DEBUG")
 
 
 class PearlWorker:
@@ -200,9 +202,21 @@ class PearlWorker:
         return torch.cat(masks, dim=0)
 
     def _compute_prefix_logits(self, batch: ScheduleBatch):
-        pre_indices = [
-            i for i, req in enumerate(batch.reqs) if getattr(req, "pre_verify", True)
-        ]
+        max_context_len = self.req_to_token_pool.req_to_token.shape[1]
+        max_reqs = self.req_to_token_pool.req_to_token.shape[0]
+        seq_lens_cpu = batch.seq_lens_cpu.tolist()
+        req_pool_indices_cpu = batch.req_pool_indices.cpu().tolist()
+        pre_indices = []
+        for i, req in enumerate(batch.reqs):
+            if not getattr(req, "pre_verify", True):
+                continue
+            seq_len = int(seq_lens_cpu[i])
+            req_pool_idx = int(req_pool_indices_cpu[i])
+            if seq_len <= 0 or seq_len >= max_context_len:
+                continue
+            if req_pool_idx < 0 or req_pool_idx >= max_reqs:
+                continue
+            pre_indices.append(i)
         if not pre_indices:
             return None, None
 
@@ -218,10 +232,10 @@ class PearlWorker:
                 else req.origin_input_ids[-1]
             )
             input_ids.append(last_token)
-            seq_len = int(batch.seq_lens[idx].item())
+            seq_len = int(batch.seq_lens_cpu[idx])
             seq_lens.append(seq_len)
             seq_lens_cpu.append(seq_len)
-            req_pool_indices.append(int(batch.req_pool_indices[idx].item()))
+            req_pool_indices.append(int(req_pool_indices_cpu[idx]))
 
         out_cache_loc = self.token_to_kv_pool_allocator.alloc(len(pre_indices))
         if out_cache_loc is None:
@@ -339,19 +353,21 @@ class PearlWorker:
             prev_window = getattr(req, "pearl_prev_window", None)
             if not getattr(req, "pre_verify", True) and prev_window is not None:
                 verify_tokens.append(prev_window.to(self.device))
-                logger.info(
-                    "PEARL verify window req=%s mode=post prev_window_len=%d",
-                    req.rid,
-                    prev_window.numel(),
-                )
+                if _PEARL_DEBUG:
+                    logger.info(
+                        "PEARL verify window req=%s mode=post prev_window_len=%d",
+                        req.rid,
+                        prev_window.numel(),
+                    )
             else:
                 verify_tokens.append(draft_tokens[i])
-                logger.info(
-                    "PEARL verify window req=%s mode=%s current_window_len=%d",
-                    req.rid,
-                    "pre" if getattr(req, "pre_verify", True) else "post",
-                    draft_tokens[i].numel(),
-                )
+                if _PEARL_DEBUG:
+                    logger.info(
+                        "PEARL verify window req=%s mode=%s current_window_len=%d",
+                        req.rid,
+                        "pre" if getattr(req, "pre_verify", True) else "post",
+                        draft_tokens[i].numel(),
+                    )
         verify_tokens = torch.stack(verify_tokens, dim=0)
 
         batch.out_cache_loc = out_cache_loc
@@ -421,6 +437,9 @@ class PearlWorker:
         accept_lengths = spec_info.accept_length.cpu().tolist()
         revised_entries = []
         prefix = 0
+        total_slots = (
+            int(batch.out_cache_loc.numel()) if batch.out_cache_loc is not None else 0
+        )
         for i, req in enumerate(batch.reqs):
             revised = getattr(req, "pearl_revised_token", None)
             keep = accept_lengths[i] + 1
@@ -428,6 +447,10 @@ class PearlWorker:
                 offset, token_id = revised
                 if offset < keep:
                     cache_index = prefix + offset
+                    if cache_index >= total_slots:
+                        req.pearl_revised_token = None
+                        prefix += keep
+                        continue
                     base_len = int(batch.seq_lens[i].item()) - keep
                     position = base_len + offset
                     revised_entries.append((i, cache_index, token_id, position))

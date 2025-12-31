@@ -24,8 +24,10 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+_PEARL_DEBUG = get_bool_env_var("SGLANG_PEARL_DEBUG")
 
 
 @dataclass
@@ -331,7 +333,7 @@ class PearlVerifyInput(SpecInput):
                     )
 
             decoded_tokens = None
-            if tokens_to_append and getattr(req, "tokenizer", None) is not None:
+            if _PEARL_DEBUG and tokens_to_append and getattr(req, "tokenizer", None) is not None:
                 try:
                     decoded_tokens = req.tokenizer.decode(
                         tokens_to_append,
@@ -367,24 +369,25 @@ class PearlVerifyInput(SpecInput):
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += max(verified_count - 1, 0)
             accept_length_list.append(max(verified_count - 1, 0))
-            logger.info(
-                "PEARL verify req=%s pre_verify_before=%s pre_verify_after=%s "
-                "accept_count=%d verified_count=%d reject_pos=%s remaining=%d "
-                "append_len=%d kv_len=%d finished=%s target_prob0=%.6f appended=%s decoded=%s",
-                req.rid,
-                pre_verify_before,
-                req.pre_verify,
-                accept_count,
-                verified_count,
-                reject_pos,
-                remaining,
-                len(tokens_to_append),
-                len(tokens_for_kv) if tokens_for_kv is not None else 0,
-                req.finished(),
-                float(target_prob[i, 0].item()) if target_prob.numel() else 0.0,
-                tokens_to_append,
-                repr(decoded_tokens) if decoded_tokens is not None else None,
-            )
+            if _PEARL_DEBUG:
+                logger.info(
+                    "PEARL verify req=%s pre_verify_before=%s pre_verify_after=%s "
+                    "accept_count=%d verified_count=%d reject_pos=%s remaining=%d "
+                    "append_len=%d kv_len=%d finished=%s target_prob0=%.6f appended=%s decoded=%s",
+                    req.rid,
+                    pre_verify_before,
+                    req.pre_verify,
+                    accept_count,
+                    verified_count,
+                    reject_pos,
+                    remaining,
+                    len(tokens_to_append),
+                    len(tokens_for_kv) if tokens_for_kv is not None else 0,
+                    req.finished(),
+                    float(target_prob[i, 0].item()) if target_prob.numel() else 0.0,
+                    tokens_to_append,
+                    repr(decoded_tokens) if decoded_tokens is not None else None,
+                )
 
         if has_finished:
             pass
@@ -428,8 +431,15 @@ class PearlVerifyInput(SpecInput):
         return logits_output, self.verified_id, num_accepted_tokens, accept_length_list
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        if self.accept_length is not None:
-            self.accept_length = self.accept_length[new_indices]
+        if self.accept_length is None:
+            return
+
+        if has_been_filtered:
+            # Batch already filtered during verify; only keep the leading slice.
+            keep_len = int(new_indices.numel())
+            self.accept_length = self.accept_length[:keep_len]
+        else:
+            self.accept_length = self.accept_length[new_indices.to(self.accept_length.device)]
 
     def merge_batch(self, spec_info: "PearlVerifyInput"):
         if spec_info is None:

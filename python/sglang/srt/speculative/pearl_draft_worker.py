@@ -13,9 +13,11 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils import empty_context
 
 logger = logging.getLogger(__name__)
+_PEARL_DRAFT_SYNC = get_bool_env_var("SGLANG_PEARL_DRAFT_SYNC")
 
 
 class PearlDraftWorker:
@@ -318,7 +320,7 @@ class PearlDraftWorker:
         draft_tokens = []
 
         self._sync_cache(batch)
-        if torch.cuda.is_available():
+        if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
         req_pool_indices = torch.tensor(
@@ -343,6 +345,7 @@ class PearlDraftWorker:
             device=self.device,
         )
 
+        sampling_info = self._build_sampling_info(batch.reqs)
         for step in range(self.speculative_num_draft_tokens):
             step_seq_lens = torch.tensor(
                 [self._cache_lens[req.rid] + step for req in batch.reqs],
@@ -368,7 +371,6 @@ class PearlDraftWorker:
             )
             step_cache_indices.append(step_out_cache_loc)
 
-            sampling_info = self._build_sampling_info(batch.reqs)
             model_worker_batch = ModelWorkerBatch(
                 forward_mode=ForwardMode.DECODE,
                 input_ids=current_tokens,
@@ -418,7 +420,7 @@ class PearlDraftWorker:
             batch_result = self.draft_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
-            if torch.cuda.is_available():
+            if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
             logits_output = batch_result.logits_output
             next_tokens = torch.argmax(logits_output.next_token_logits, dim=-1)
@@ -428,6 +430,6 @@ class PearlDraftWorker:
         if step_cache_indices:
             self.token_to_kv_pool_allocator.free(torch.cat(step_cache_indices))
 
-        if torch.cuda.is_available():
+        if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
         return torch.stack(draft_tokens, dim=1)
