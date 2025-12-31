@@ -431,6 +431,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_draft_gpu_id: Optional[int] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -3459,6 +3460,12 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--speculative-draft-gpu-id",
+            type=int,
+            default=ServerArgs.speculative_draft_gpu_id,
+            help="The GPU id to place the draft model for speculative decoding.",
         )
 
         # Speculative decoding (ngram)

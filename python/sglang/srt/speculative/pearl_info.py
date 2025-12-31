@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
@@ -36,6 +37,9 @@ class PearlVerifyInput(SpecInput):
         positions: torch.Tensor,
         draft_token_num: int,
         vocab_size: int,
+        next_window_tokens: Optional[torch.Tensor] = None,
+        prefix_logits: Optional[torch.Tensor] = None,
+        prefix_logits_mask: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.PEARL_VERIFY)
         self.draft_token = draft_token
@@ -44,6 +48,9 @@ class PearlVerifyInput(SpecInput):
         self.draft_token_num = draft_token_num
         self.vocab_size = vocab_size
         self.device = draft_token.device
+        self.next_window_tokens = next_window_tokens
+        self.prefix_logits = prefix_logits
+        self.prefix_logits_mask = prefix_logits_mask
         self.accepted_indices: Optional[torch.Tensor] = None
         self.accept_length: Optional[torch.Tensor] = None
         self.verified_id: Optional[torch.Tensor] = None
@@ -135,26 +142,52 @@ class PearlVerifyInput(SpecInput):
     ):
         bs = batch.batch_size()
         sampling_info: SamplingBatchInfo = batch.sampling_info
+        raw_logits = logits_output.next_token_logits.view(bs, self.draft_token_num, -1)
+        aligned_logits = torch.empty_like(raw_logits)
+        aligned_logits[:, 1:] = raw_logits[:, :-1]
+        prev_logits_list = []
+        for i, req in enumerate(batch.reqs):
+            prev_logits = getattr(req, "pearl_prev_logits", None)
+            if (
+                self.prefix_logits is not None
+                and self.prefix_logits_mask is not None
+                and self.prefix_logits_mask[i]
+            ):
+                prev_logits_list.append(self.prefix_logits[i])
+            elif prev_logits is None or prev_logits.shape[-1] != raw_logits.shape[-1]:
+                prev_logits_list.append(raw_logits[i, 0])
+            else:
+                prev_logits_list.append(prev_logits.to(raw_logits.device))
+        aligned_logits[:, 0] = torch.stack(prev_logits_list, dim=0)
 
-        # Apply custom logit processors (if any).
+        aligned_logits = aligned_logits.reshape(bs * self.draft_token_num, -1)
+
+        # Apply custom logit processors (if any) on the aligned logits.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
-                logits_output.next_token_logits,
+                aligned_logits,
                 sampling_info,
                 num_tokens_in_batch=self.draft_token_num,
             )
 
-        # Apply penalty in a relaxed way for speculative decoding.
-        if sampling_info.penalizer_orchestrator.is_required:
+        # Apply penalty/logit bias in a relaxed way for speculative decoding.
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             linear_penalty = torch.zeros(
-                (bs, logits_output.next_token_logits.shape[1]),
+                (bs, aligned_logits.shape[1]),
                 dtype=torch.float32,
                 device=self.device,
             )
             sampling_info.apply_logits_bias(linear_penalty)
-            logits_output.next_token_logits.add_(
+            aligned_logits.add_(
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
             )
+
+        # Keep logits_output in sync for logprob reporting.
+        logits_output.next_token_logits = aligned_logits
+        aligned_logits = aligned_logits.view(bs, self.draft_token_num, -1)
 
         if self.vocab_size:
             self.draft_token = torch.clamp(
@@ -166,10 +199,11 @@ class PearlVerifyInput(SpecInput):
             .clamp(min=1e-5)
             .unsqueeze(1)
         )
-        scaled_logits = logits_output.next_token_logits / temperatures
+        scaled_logits = aligned_logits.reshape(bs * self.draft_token_num, -1) / temperatures
         probs = torch.softmax(scaled_logits, dim=-1)
         target_prob = probs.gather(1, self.draft_token.unsqueeze(1)).squeeze(1)
         target_prob = target_prob.view(bs, self.draft_token_num)
+        probs_view = probs.view(bs, self.draft_token_num, -1)
 
         accepted_indices = []
         verified_tokens = []
@@ -181,45 +215,176 @@ class PearlVerifyInput(SpecInput):
         for i, req in enumerate(batch.reqs):
             accept_count = 0
             reject_pos = None
+            pre_verify = getattr(req, "pre_verify", True)
+            pre_verify_before = pre_verify
+            next_window = None
+            if self.next_window_tokens is not None:
+                next_window = self.next_window_tokens[i].tolist()
+            tokens_for_kv = None
+            used_revised_token = False
+            revised_offset = None
+            req.pearl_revised_token = None
 
-            for j in range(self.draft_token_num):
-                if coins[i, j] <= target_prob[i, j]:
-                    accept_count += 1
+            if pre_verify:
+                if coins[i, 0] <= target_prob[i, 0]:
+                    tokens_to_append = [draft_tokens[i, 0].item()]
+                    tokens_for_kv = tokens_to_append
+                    accept_count = 1
+                    req.pre_verify = False
                 else:
-                    reject_pos = j
-                    break
-
-            if reject_pos is None:
-                tokens_to_append = draft_tokens[i, :accept_count].tolist()
+                    draft_token_id = draft_tokens[i, 0].item()
+                    probs_row = probs_view[i, 0].clone()
+                    probs_row[draft_token_id] = 0.0
+                    norm = probs_row.sum()
+                    if norm > 0:
+                        probs_row = probs_row / norm
+                    probs_row = probs_row.unsqueeze(0)
+                    position = int(batch.seq_lens[i].item())
+                    positions = torch.tensor([position], device=probs_row.device)
+                    sampling_seed = (
+                        sampling_info.sampling_seed[i : i + 1]
+                        if sampling_info.sampling_seed is not None
+                        else None
+                    )
+                    revised_token = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs_row,
+                        sampling_info.top_ks[i : i + 1],
+                        sampling_info.top_ps[i : i + 1],
+                        sampling_info.min_ps[i : i + 1],
+                        sampling_info.need_min_p_sampling,
+                        sampling_seed,
+                        positions,
+                    )[0].item()
+                    tokens_to_append = [revised_token]
+                    tokens_for_kv = [revised_token]
+                    accept_count = 1
+                    req.pre_verify = True
+                    used_revised_token = True
+                    revised_offset = 0
             else:
-                probs_row = probs.view(bs, self.draft_token_num, -1)[i, reject_pos]
-                draft_token = draft_tokens[i, reject_pos]
-                probs_row = probs_row.clone()
-                probs_row[draft_token] = 0
-                norm = probs_row.sum()
-                if norm > 0:
-                    probs_row = probs_row / norm
-                    revised_token = torch.multinomial(probs_row, 1).item()
+                for j in range(self.draft_token_num):
+                    if coins[i, j] <= target_prob[i, j]:
+                        accept_count += 1
+                    else:
+                        reject_pos = j
+                        break
+
+                if reject_pos is None:
+                    tokens_to_append = draft_tokens[i, :accept_count].tolist()
+                    tokens_for_kv = draft_tokens[i, :accept_count].tolist()
+                    req.pre_verify = False
                 else:
-                    revised_token = draft_token.item()
-                tokens_to_append = draft_tokens[i, :reject_pos].tolist() + [
-                    revised_token
-                ]
-                accept_count = reject_pos + 1
+                    draft_token_id = draft_tokens[i, reject_pos].item()
+                    probs_row = probs_view[i, reject_pos].clone()
+                    probs_row[draft_token_id] = 0.0
+                    norm = probs_row.sum()
+                    if norm > 0:
+                        probs_row = probs_row / norm
+                    probs_row = probs_row.unsqueeze(0)
+                    position = int(batch.seq_lens[i].item()) + reject_pos
+                    positions = torch.tensor([position], device=probs_row.device)
+                    sampling_seed = (
+                        sampling_info.sampling_seed[i : i + 1]
+                        if sampling_info.sampling_seed is not None
+                        else None
+                    )
+                    revised_token = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs_row,
+                        sampling_info.top_ks[i : i + 1],
+                        sampling_info.top_ps[i : i + 1],
+                        sampling_info.min_ps[i : i + 1],
+                        sampling_info.need_min_p_sampling,
+                        sampling_seed,
+                        positions,
+                    )[0].item()
+                    tokens_to_append = draft_tokens[i, :reject_pos].tolist() + [
+                        revised_token
+                    ]
+                    tokens_for_kv = draft_tokens[i, :reject_pos].tolist() + [
+                        revised_token
+                    ]
+                    accept_count = reject_pos + 1
+                    req.pre_verify = True
+                    used_revised_token = True
+                    revised_offset = reject_pos
+
+            remaining = req.sampling_params.max_new_tokens - len(req.output_ids)
+            if remaining <= 0:
+                req.check_finished()
+                has_finished = True
+                accept_count = 0
+                accept_length_list.append(0)
+                continue
+
+            if remaining < len(tokens_to_append):
+                tokens_to_append = tokens_to_append[:remaining]
+            if tokens_for_kv is None:
+                tokens_for_kv = tokens_to_append
+            verified_count = min(len(tokens_for_kv), remaining)
+            tokens_for_kv = tokens_for_kv[:verified_count]
+
+            if used_revised_token and revised_offset is not None:
+                if revised_offset < len(tokens_to_append):
+                    req.pearl_revised_token = (
+                        revised_offset,
+                        tokens_to_append[revised_offset],
+                    )
+
+            decoded_tokens = None
+            if tokens_to_append and getattr(req, "tokenizer", None) is not None:
+                try:
+                    decoded_tokens = req.tokenizer.decode(
+                        tokens_to_append,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                except Exception:
+                    decoded_tokens = None
 
             for offset, token_id in enumerate(tokens_to_append):
                 req.output_ids.append(token_id)
                 req.check_finished()
-                accepted_indices.append(i * self.draft_token_num + offset)
-                verified_tokens.append(token_id)
+                if offset < verified_count:
+                    accepted_indices.append(i * self.draft_token_num + offset)
+                    verified_tokens.append(tokens_for_kv[offset])
                 if req.finished():
                     has_finished = True
-                    accept_count = offset + 1
+                    verified_count = min(verified_count, offset + 1)
                     break
 
+            if not req.pre_verify and next_window is not None:
+                req.pearl_prev_window = torch.tensor(
+                    next_window, dtype=torch.int64, device=self.device
+                )
+            else:
+                req.pearl_prev_window = None
+
+            if verified_count > 0 and not used_revised_token:
+                req.pearl_prev_logits = raw_logits[i, verified_count - 1].detach()
+            elif used_revised_token:
+                req.pearl_prev_logits = None
+
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += max(accept_count - 1, 0)
-            accept_length_list.append(max(accept_count - 1, 0))
+            req.spec_accepted_tokens += max(verified_count - 1, 0)
+            accept_length_list.append(max(verified_count - 1, 0))
+            logger.info(
+                "PEARL verify req=%s pre_verify_before=%s pre_verify_after=%s "
+                "accept_count=%d verified_count=%d reject_pos=%s remaining=%d "
+                "append_len=%d kv_len=%d finished=%s target_prob0=%.6f appended=%s decoded=%s",
+                req.rid,
+                pre_verify_before,
+                req.pre_verify,
+                accept_count,
+                verified_count,
+                reject_pos,
+                remaining,
+                len(tokens_to_append),
+                len(tokens_for_kv) if tokens_for_kv is not None else 0,
+                req.finished(),
+                float(target_prob[i, 0].item()) if target_prob.numel() else 0.0,
+                tokens_to_append,
+                repr(decoded_tokens) if decoded_tokens is not None else None,
+            )
 
         if has_finished:
             pass

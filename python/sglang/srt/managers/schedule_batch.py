@@ -718,6 +718,12 @@ class Req:
         # The number of accepted tokens in speculative decoding for this request.
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
+        # PEARL state machine: True means pre-verify mode.
+        self.pre_verify = True
+        # PEARL pipeline: previous draft window (on target device).
+        self.pearl_prev_window = None
+        # PEARL: cached target logits for the last committed token.
+        self.pearl_prev_logits = None
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
