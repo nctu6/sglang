@@ -332,6 +332,10 @@ class PearlVerifyInput(SpecInput):
                         tokens_to_append[revised_offset],
                     )
 
+            req.pearl_accept_count = accept_count
+            req.pearl_reject_pos = reject_pos
+            req.pearl_used_revised = used_revised_token
+
             decoded_tokens = None
             if _PEARL_DEBUG and tokens_to_append and getattr(req, "tokenizer", None) is not None:
                 try:

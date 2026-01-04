@@ -1982,11 +1982,12 @@ class ServerArgs:
                 self.disable_overlap_schedule = True
 
             if self.speculative_algorithm == "PEARL":
-                if not self.disable_cuda_graph:
-                    self.disable_cuda_graph = True
-                    logger.warning(
-                        "CUDA graphs are disabled for PEARL speculative decoding."
-                    )
+                if not envs.SGLANG_PEARL_ENABLE_CUDA_GRAPH.get():
+                    if not self.disable_cuda_graph:
+                        self.disable_cuda_graph = True
+                        logger.warning(
+                            "CUDA graphs are disabled for PEARL speculative decoding."
+                        )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
@@ -2041,7 +2042,18 @@ class ServerArgs:
                     logger.warning(
                         "speculative_num_steps is not set for PEARL; defaulting to 4."
                     )
-                if self.speculative_num_draft_tokens is None:
+                if self.speculative_num_steps == -1:
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = -1
+                else:
+                    if (
+                        self.speculative_num_draft_tokens is not None
+                        and self.speculative_num_draft_tokens != self.speculative_num_steps
+                    ):
+                        logger.warning(
+                            "PEARL ignores speculative_num_draft_tokens; using speculative_num_steps=%s.",
+                            self.speculative_num_steps,
+                        )
                     self.speculative_num_draft_tokens = self.speculative_num_steps
 
             if (
@@ -2066,10 +2078,8 @@ class ServerArgs:
                     self.speculative_num_draft_tokens = (
                         self.speculative_num_steps + 1
                     )
-            elif self.speculative_num_draft_tokens != self.speculative_num_steps:
-                logger.warning(
-                    "PEARL uses speculative_num_steps tokens; aligning speculative_num_draft_tokens."
-                )
+            elif self.speculative_num_steps != -1:
+                # Always tie draft tokens to steps for PEARL.
                 self.speculative_num_draft_tokens = self.speculative_num_steps
 
             if self.speculative_algorithm != "PEARL":
@@ -3394,7 +3404,10 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-num-steps",
             type=int,
-            help="The number of steps sampled from draft model in Speculative Decoding.",
+            help=(
+                "The number of steps sampled from draft model in Speculative Decoding. "
+                "For PEARL, use -1 to auto-tune based on draft/target speed."
+            ),
             default=ServerArgs.speculative_num_steps,
         )
         parser.add_argument(

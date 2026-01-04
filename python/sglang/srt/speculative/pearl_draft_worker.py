@@ -1,9 +1,11 @@
+import copy
 import logging
 import os
 from typing import Dict, Optional
 
 import torch
 
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -97,10 +99,22 @@ class PearlDraftWorker:
         self._cache_lens: Dict[str, int] = {}
         self._cache_indices: Dict[str, torch.Tensor] = {}
         self._req_pool_map: Dict[int, int] = {}
+        self._draft_buffers: Dict[str, list[int]] = {}
 
     def clear_cache_pool(self):
         # Allocator is shared with target worker.
         pass
+
+    def set_speculative_num_draft_tokens(self, num_tokens: int) -> None:
+        if num_tokens <= 0:
+            raise ValueError("PEARL speculative_num_draft_tokens must be positive.")
+        if num_tokens == self.speculative_num_draft_tokens:
+            return
+        self.speculative_num_draft_tokens = num_tokens
+        self.server_args.speculative_num_draft_tokens = num_tokens
+        for rid, buffer in self._draft_buffers.items():
+            if len(buffer) > num_tokens:
+                self._draft_buffers[rid] = buffer[:num_tokens]
 
     def release_req(self, req):
         rid = req.rid
@@ -113,6 +127,7 @@ class PearlDraftWorker:
         if indices is not None and indices.numel() > 0:
             self.token_to_kv_pool_allocator.free(indices)
         self._cache_lens.pop(rid, None)
+        self._draft_buffers.pop(rid, None)
 
     def _build_sampling_info(self, reqs):
         class _DummyBatch:
@@ -194,18 +209,26 @@ class PearlDraftWorker:
             rid = req.rid
             target_ids = req.origin_input_ids + req.output_ids
             target_len = len(target_ids)
+            buffer_len = len(self._draft_buffers.get(rid, []))
+            desired_len = target_len + buffer_len
 
             cached_len = self._cache_lens.get(rid, 0)
             cached_indices = self._cache_indices.get(
                 rid, torch.empty((0,), dtype=torch.int64, device=self.device)
             )
 
-            if cached_len > target_len:
-                to_free = cached_indices[target_len:]
+            if cached_len > desired_len:
+                to_free = cached_indices[desired_len:]
                 if to_free.numel() > 0:
                     self.token_to_kv_pool_allocator.free(to_free)
-                cached_indices = cached_indices[:target_len]
-                cached_len = target_len
+                cached_indices = cached_indices[:desired_len]
+                cached_len = desired_len
+
+            if cached_len < desired_len and buffer_len > 0:
+                # Cache is behind the buffer; drop buffer to keep consistency.
+                self._draft_buffers[rid] = []
+                buffer_len = 0
+                desired_len = target_len
 
             if cached_len < target_len:
                 missing_ids = target_ids[cached_len:]
@@ -313,6 +336,37 @@ class PearlDraftWorker:
                 model_worker_batch, is_verify=True
             )
 
+    def update_after_verify(self, reqs):
+        for req in reqs:
+            rid = req.rid
+            buffer = self._draft_buffers.get(rid, [])
+            accept_count = getattr(req, "pearl_accept_count", 0)
+            reject_pos = getattr(req, "pearl_reject_pos", None)
+            used_revised = getattr(req, "pearl_used_revised", False)
+
+            if used_revised or reject_pos is not None:
+                buffer = []
+            elif accept_count > 0:
+                buffer = buffer[accept_count:]
+
+            self._draft_buffers[rid] = buffer
+
+            target_len = len(req.origin_input_ids) + len(req.output_ids)
+            desired_len = target_len + len(buffer)
+            cached_len = self._cache_lens.get(rid, 0)
+            cached_indices = self._cache_indices.get(
+                rid, torch.empty((0,), dtype=torch.int64, device=self.device)
+            )
+            if cached_len > desired_len:
+                to_free = cached_indices[desired_len:]
+                if to_free.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(to_free)
+                cached_indices = cached_indices[:desired_len]
+                cached_len = desired_len
+
+            self._cache_indices[rid] = cached_indices
+            self._cache_lens[rid] = cached_len
+
     def run_draft(self, batch: ScheduleBatch):
         if torch.cuda.is_available():
             torch.cuda.set_device(self.model_runner.gpu_id)
@@ -335,20 +389,44 @@ class PearlDraftWorker:
                 "Draft req_pool_indices out of range: max=%d size=%d"
                 % (int(req_pool_indices.max().item()), max_reqs)
             )
-        step_cache_indices = []
-        current_tokens = torch.tensor(
-            [
-                (req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1])
-                for req in batch.reqs
-            ],
-            dtype=torch.int64,
-            device=self.device,
-        )
+        buffers = {
+            req.rid: list(self._draft_buffers.get(req.rid, [])) for req in batch.reqs
+        }
+        current_tokens = {}
+        for req in batch.reqs:
+            buffer = buffers[req.rid]
+            if buffer:
+                current_tokens[req.rid] = buffer[-1]
+            else:
+                current_tokens[req.rid] = (
+                    req.output_ids[-1]
+                    if req.output_ids
+                    else req.origin_input_ids[-1]
+                )
 
         sampling_info = self._build_sampling_info(batch.reqs)
-        for step in range(self.speculative_num_draft_tokens):
+        for _ in range(self.speculative_num_draft_tokens):
+            active = [
+                i
+                for i, req in enumerate(batch.reqs)
+                if len(buffers[req.rid]) < self.speculative_num_draft_tokens
+            ]
+            if not active:
+                break
+
+            active_req_pool = req_pool_indices[active]
+            input_ids = torch.tensor(
+                [current_tokens[batch.reqs[i].rid] for i in active],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            sampling_info_active = sampling_info
+            if len(active) != bs:
+                sampling_info_active = copy.deepcopy(sampling_info)
+                keep_indices_device = torch.tensor(active, device=self.device)
+                sampling_info_active.filter_batch(active, keep_indices_device)
             step_seq_lens = torch.tensor(
-                [self._cache_lens[req.rid] + step for req in batch.reqs],
+                [self._cache_lens[batch.reqs[i].rid] for i in active],
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -357,24 +435,21 @@ class PearlDraftWorker:
                     "Draft seq_lens exceed context: max=%d limit=%d"
                     % (int(step_seq_lens.max().item()), max_context_len)
                 )
-            step_seq_lens_cpu = torch.tensor(
-                [self._cache_lens[req.rid] + step for req in batch.reqs],
-                dtype=torch.int64,
-            )
+            step_seq_lens_cpu = step_seq_lens.cpu()
             step_seq_lens_sum = int(step_seq_lens.sum().item())
 
-            step_out_cache_loc = self.token_to_kv_pool_allocator.alloc(bs)
+            step_out_cache_loc = self.token_to_kv_pool_allocator.alloc(len(active))
             if step_out_cache_loc is None:
                 raise RuntimeError("Draft KV cache allocation failed.")
             self.req_to_token_pool.write(
-                (req_pool_indices, step_seq_lens), step_out_cache_loc.to(torch.int32)
+                (active_req_pool, step_seq_lens),
+                step_out_cache_loc.to(torch.int32),
             )
-            step_cache_indices.append(step_out_cache_loc)
 
             model_worker_batch = ModelWorkerBatch(
                 forward_mode=ForwardMode.DECODE,
-                input_ids=current_tokens,
-                req_pool_indices=req_pool_indices,
+                input_ids=input_ids,
+                req_pool_indices=active_req_pool,
                 seq_lens=step_seq_lens,
                 out_cache_loc=step_out_cache_loc,
                 seq_lens_cpu=step_seq_lens_cpu,
@@ -393,13 +468,13 @@ class PearlDraftWorker:
                 extend_prefix_lens=None,
                 extend_logprob_start_lens=None,
                 extend_input_logprob_token_ids=None,
-                multimodal_inputs=[r.multimodal_inputs for r in batch.reqs],
+                multimodal_inputs=[batch.reqs[i].multimodal_inputs for i in active],
                 encoder_cached=None,
                 encoder_lens=None,
                 encoder_lens_cpu=None,
                 encoder_out_cache_loc=None,
-                lora_ids=[r.lora_id for r in batch.reqs],
-                sampling_info=sampling_info,
+                lora_ids=[batch.reqs[i].lora_id for i in active],
+                sampling_info=sampling_info_active,
                 input_embeds=None,
                 token_type_ids=None,
                 spec_algorithm=None,
@@ -410,7 +485,7 @@ class PearlDraftWorker:
                 dimensions=None,
                 dllm_block_offsets=None,
                 dllm_config=None,
-                reqs=batch.reqs,
+                reqs=[batch.reqs[i] for i in active],
                 has_grammar=False,
                 mamba_track_indices=None,
                 mamba_track_mask=None,
@@ -423,13 +498,39 @@ class PearlDraftWorker:
             if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
             logits_output = batch_result.logits_output
-            next_tokens = torch.argmax(logits_output.next_token_logits, dim=-1)
-            draft_tokens.append(next_tokens)
-            current_tokens = next_tokens
+            logits = logits_output.next_token_logits
+            if sampling_info_active.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits, sampling_info_active, num_tokens_in_batch=1
+                )
+            if sampling_info_active.penalizer_orchestrator is not None:
+                sampling_info_active.apply_logits_bias(logits)
+            temperatures = (
+                sampling_info_active.temperatures.view(-1)
+                .to(logits.device)
+                .clamp(min=1e-5)
+            )
+            logits = logits / temperatures.unsqueeze(1)
+            next_tokens = torch.argmax(logits, dim=-1)
 
-        if step_cache_indices:
-            self.token_to_kv_pool_allocator.free(torch.cat(step_cache_indices))
+            for idx, req_idx in enumerate(active):
+                rid = batch.reqs[req_idx].rid
+                token = int(next_tokens[idx].item())
+                buffers[rid].append(token)
+                current_tokens[rid] = token
+                cached_indices = self._cache_indices.get(
+                    rid, torch.empty((0,), dtype=torch.int64, device=self.device)
+                )
+                self._cache_indices[rid] = torch.cat(
+                    [cached_indices, step_out_cache_loc[idx : idx + 1]], dim=0
+                )
+                self._cache_lens[rid] = self._cache_lens.get(rid, 0) + 1
+
+        for req in batch.reqs:
+            buffer = buffers[req.rid]
+            self._draft_buffers[req.rid] = buffer
+            draft_tokens.append(buffer[: self.speculative_num_draft_tokens])
 
         if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
-        return torch.stack(draft_tokens, dim=1)
+        return torch.tensor(draft_tokens, dtype=torch.int64, device=self.device)
