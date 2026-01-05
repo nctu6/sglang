@@ -279,6 +279,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.name == "PEARL"
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -371,6 +372,8 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if getattr(forward_batch, "disable_cuda_graph", False):
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -911,6 +914,20 @@ class CudaGraphRunner:
                 retrive_next_token=None,
                 retrive_next_sibling=None,
                 draft_token_num=self.num_tokens_per_bs,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+        elif self.model_runner.spec_algorithm.name == "PEARL":
+            from sglang.srt.speculative.pearl_info import PearlVerifyInput
+
+            draft_token = torch.zeros(
+                (num_tokens,), dtype=torch.int64, device=self.buffers.input_ids.device
+            )
+            spec_info = PearlVerifyInput(
+                draft_token,
+                self.buffers.custom_mask,
+                positions=None,
+                draft_token_num=self.num_tokens_per_bs,
+                vocab_size=self.model_runner.model_config.vocab_size,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

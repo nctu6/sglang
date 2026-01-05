@@ -2263,6 +2263,8 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+    # Force disabling CUDA graph for this batch.
+    disable_cuda_graph: bool = False
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

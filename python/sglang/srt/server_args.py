@@ -2042,6 +2042,16 @@ class ServerArgs:
                     logger.warning(
                         "speculative_num_steps is not set for PEARL; defaulting to 4."
                     )
+                if (
+                    self.speculative_num_steps == -1
+                    and envs.SGLANG_PEARL_ENABLE_CUDA_GRAPH.get()
+                ):
+                    # CUDA graph capture needs a fixed token count.
+                    self.speculative_num_steps = 2
+                    logger.warning(
+                        "PEARL auto-tune (-1) is disabled when CUDA graphs are enabled; "
+                        "using speculative_num_steps=2."
+                    )
                 if self.speculative_num_steps == -1:
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = -1

@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import logging
 import os
 import time
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.pearl_draft_worker import PearlDraftWorker
 from sglang.srt.speculative.pearl_info import PearlVerifyInput
@@ -102,6 +104,17 @@ class PearlWorker:
         if torch.cuda.is_available():
             torch.cuda.set_device(self.target_gpu_id)
 
+    def _build_sampling_info(self, reqs):
+        class _DummyBatch:
+            __slots__ = ("reqs", "device", "__weakref__")
+
+            def __init__(self, reqs, device):
+                self.reqs = reqs
+                self.device = device
+
+        dummy = _DummyBatch(reqs=reqs, device=self.device)
+        return SamplingBatchInfo.from_schedule_batch(dummy, self.target_vocab_size)
+
     def _parse_int_list_env(self, name: str, default: list[int]) -> list[int]:
         raw = os.environ.get(name)
         if not raw:
@@ -153,17 +166,22 @@ class PearlWorker:
         profile_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_PROFILE_STEPS", "12"))
         skip_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_SKIP_STEPS", "2"))
         max_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MAX", "16"))
+        steps_mult = float(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MULT", "1.0"))
         max_steps = max(1, max_steps)
+        if steps_mult <= 0:
+            raise ValueError("PEARL auto steps multiplier must be positive.")
         if profile_steps <= 0:
             raise ValueError("PEARL auto steps profile_steps must be positive.")
         if skip_steps < 0:
             raise ValueError("PEARL auto steps skip_steps must be non-negative.")
         logger.info(
-            "PEARL auto steps profiling: buckets=%s profile_steps=%s skip_steps=%s max_steps=%s",
+            "PEARL auto steps profiling: buckets=%s profile_steps=%s skip_steps=%s "
+            "max_steps=%s mult=%s",
             buckets,
             profile_steps,
             skip_steps,
             max_steps,
+            steps_mult,
         )
 
         results = []
@@ -188,6 +206,7 @@ class PearlWorker:
                 self.target_worker.model_runner, profile_bs, profile_steps, skip_steps
             )
             ratio = draft_speed / max(target_speed, 1e-6)
+            ratio *= steps_mult
             steps = int(round(ratio))
             steps = max(1, min(max_steps, steps))
             logger.info(
@@ -425,6 +444,7 @@ class PearlWorker:
             spec_info=None,
             hicache_consumer_index=-1,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            disable_cuda_graph=True,
             is_prefill_only=False,
             dimensions=None,
             dllm_block_offsets=None,
@@ -449,6 +469,120 @@ class PearlWorker:
         self.token_to_kv_pool_allocator.free(out_cache_loc)
         return pre_indices, prefix_logits
 
+    def _slice_out_cache_loc(self, out_cache_loc: torch.Tensor, indices: list[int]):
+        if out_cache_loc is None or not indices:
+            return None
+        stride = self.speculative_num_draft_tokens
+        segments = []
+        for idx in indices:
+            start = idx * stride
+            end = start + stride
+            segments.append(out_cache_loc[start:end])
+        if not segments:
+            return out_cache_loc[:0]
+        return torch.cat(segments, dim=0)
+
+    def _record_out_cache_segments(
+        self,
+        out_cache_segments: list[Optional[torch.Tensor]],
+        indices: list[int],
+        out_cache_loc: Optional[torch.Tensor],
+        accept_length_list: list[int],
+    ) -> None:
+        if out_cache_loc is None or not indices:
+            return
+        cursor = 0
+        for local_idx, batch_idx in enumerate(indices):
+            keep = int(accept_length_list[local_idx]) + 1
+            if keep <= 0:
+                out_cache_segments[batch_idx] = out_cache_loc[:0]
+                continue
+            out_cache_segments[batch_idx] = out_cache_loc[cursor : cursor + keep]
+            cursor += keep
+
+    def _build_last_token_ids(self, batch: ScheduleBatch) -> torch.Tensor:
+        token_ids = []
+        for req in batch.reqs:
+            if req.output_ids:
+                token_ids.append(req.output_ids[-1])
+            else:
+                token_ids.append(req.origin_input_ids[-1])
+        return torch.tensor(token_ids, dtype=torch.int64, device=self.device)
+
+    def _verify_subset(
+        self,
+        batch: ScheduleBatch,
+        indices: list[int],
+        verify_tokens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        prefix_logits: Optional[torch.Tensor] = None,
+        prefix_logits_mask: Optional[torch.Tensor] = None,
+        next_window_tokens: Optional[torch.Tensor] = None,
+    ):
+        if not indices:
+            return None
+
+        sub_reqs = [batch.reqs[i] for i in indices]
+        sampling_info = self._build_sampling_info(sub_reqs)
+        sub_batch = dataclasses.replace(batch)
+        sub_batch.reqs = sub_reqs
+        sub_batch.req_pool_indices = batch.req_pool_indices[indices]
+        sub_batch.seq_lens = batch.seq_lens[indices]
+        sub_batch.seq_lens_cpu = batch.seq_lens_cpu[indices]
+        sub_batch.seq_lens_sum = int(sub_batch.seq_lens.sum().item())
+        if batch.orig_seq_lens is not None:
+            sub_batch.orig_seq_lens = batch.orig_seq_lens[indices]
+        sub_batch.multimodal_inputs = [req.multimodal_inputs for req in sub_reqs]
+        sub_batch.return_logprob = batch.return_logprob
+        if sub_batch.return_logprob:
+            sub_batch.top_logprobs_nums = [batch.top_logprobs_nums[i] for i in indices]
+            sub_batch.token_ids_logprobs = [
+                batch.token_ids_logprobs[i] for i in indices
+            ]
+        else:
+            sub_batch.top_logprobs_nums = None
+            sub_batch.token_ids_logprobs = None
+        sub_batch.has_stream = any(req.stream for req in sub_reqs)
+        sub_batch.has_grammar = False
+        sub_batch.sampling_info = sampling_info
+        sub_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        sub_batch.spec_algorithm = SpeculativeAlgorithm.PEARL
+        sub_batch.input_ids = verify_tokens.reshape(-1)
+        sub_batch.out_cache_loc = out_cache_loc
+
+        positions = self._build_positions(sub_batch)
+        custom_mask = self._build_custom_mask(sub_batch)
+        spec_info = PearlVerifyInput(
+            sub_batch.input_ids,
+            custom_mask,
+            positions,
+            self.speculative_num_draft_tokens,
+            self.target_vocab_size,
+            next_window_tokens=next_window_tokens,
+            prefix_logits=prefix_logits,
+            prefix_logits_mask=prefix_logits_mask,
+        )
+        sub_batch.spec_info = spec_info
+
+        model_worker_batch = sub_batch.get_model_worker_batch()
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+
+        logits_output = batch_result.logits_output
+        (
+            logits_output,
+            _verified_id,
+            _num_accepted_tokens,
+            accept_length_list,
+        ) = spec_info.verify(sub_batch, logits_output, self.page_size)
+        return {
+            "sub_batch": sub_batch,
+            "spec_info": spec_info,
+            "logits_output": logits_output,
+            "accept_length_list": accept_length_list,
+        }
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._apply_auto_steps(batch.batch_size())
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -469,41 +603,89 @@ class PearlWorker:
         out_cache_loc = self._allocate_draft_slots(batch)
         draft_future = self._draft_executor.submit(self.draft_worker.run_draft, batch)
 
-        post_verify_only = True
-        for req in batch.reqs:
-            prev_window = getattr(req, "pearl_prev_window", None)
-            if getattr(req, "pre_verify", True) or prev_window is None:
-                post_verify_only = False
-                break
-
+        post_indices = []
         pre_indices = []
+        for i, req in enumerate(batch.reqs):
+            prev_window = getattr(req, "pearl_prev_window", None)
+            if not getattr(req, "pre_verify", True) and prev_window is not None:
+                post_indices.append(i)
+            else:
+                pre_indices.append(i)
+
         pre_logits = None
         prefix_logits = None
         prefix_logits_mask = None
-
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.target_gpu_id)
-        positions = self._build_positions(batch)
-        custom_mask = self._build_custom_mask(batch)
+        if pre_indices:
+            pre_logits_indices, pre_logits = self._compute_prefix_logits(batch)
+            if pre_logits_indices:
+                prefix_logits = torch.zeros(
+                    (batch.batch_size(), self.target_vocab_size),
+                    dtype=pre_logits.dtype,
+                    device=pre_logits.device,
+                )
+                prefix_logits_mask = torch.zeros(
+                    (batch.batch_size(),), dtype=torch.bool, device=pre_logits.device
+                )
+                for row, idx in enumerate(pre_logits_indices):
+                    prefix_logits[idx] = pre_logits[row]
+                    prefix_logits_mask[idx] = True
 
         batch.spec_algorithm = SpeculativeAlgorithm.PEARL
         batch.forward_mode = ForwardMode.TARGET_VERIFY
 
-        if post_verify_only:
+        allow_split = (
+            post_indices
+            and pre_indices
+            and not batch.return_logprob
+            and not any(req.return_hidden_states for req in batch.reqs)
+        )
+
+        accept_length_list_full = [0 for _ in range(batch.batch_size())]
+        out_cache_segments: list[Optional[torch.Tensor]] = [
+            None for _ in range(batch.batch_size())
+        ]
+        logits_output = None
+        can_run_cuda_graph = False
+
+        if allow_split:
             verify_tokens = []
-            for i, req in enumerate(batch.reqs):
-                prev_window = req.pearl_prev_window
+            for idx in post_indices:
+                prev_window = batch.reqs[idx].pearl_prev_window
                 verify_tokens.append(prev_window.to(self.device))
                 if _PEARL_DEBUG:
                     logger.info(
                         "PEARL verify window req=%s mode=post prev_window_len=%d",
-                        req.rid,
+                        batch.reqs[idx].rid,
                         prev_window.numel(),
                     )
             verify_tokens = torch.stack(verify_tokens, dim=0)
-            draft_tokens = None
-        else:
-            pre_indices, pre_logits = self._compute_prefix_logits(batch)
+            post_out_cache_loc = self._slice_out_cache_loc(out_cache_loc, post_indices)
+            post_result = self._verify_subset(
+                batch,
+                post_indices,
+                verify_tokens,
+                post_out_cache_loc,
+                prefix_logits=(
+                    prefix_logits[post_indices] if prefix_logits is not None else None
+                ),
+                prefix_logits_mask=(
+                    prefix_logits_mask[post_indices]
+                    if prefix_logits_mask is not None
+                    else None
+                ),
+            )
+            if post_result is not None:
+                logits_output = post_result["logits_output"]
+                accept_length_list = post_result["accept_length_list"]
+                for local_idx, batch_idx in enumerate(post_indices):
+                    accept_length_list_full[batch_idx] = accept_length_list[local_idx]
+                self._record_out_cache_segments(
+                    out_cache_segments,
+                    post_indices,
+                    post_result["sub_batch"].out_cache_loc,
+                    accept_length_list,
+                )
+
             draft_tokens = draft_future.result()
             if self.target_vocab_size:
                 draft_tokens = torch.where(
@@ -514,10 +696,54 @@ class PearlWorker:
             if draft_tokens.device != self.device:
                 draft_tokens = draft_tokens.to(self.device, non_blocking=True)
 
+            pre_verify_tokens = draft_tokens[pre_indices]
+            if _PEARL_DEBUG:
+                for local_idx, idx in enumerate(pre_indices):
+                    logger.info(
+                        "PEARL verify window req=%s mode=pre current_window_len=%d",
+                        batch.reqs[idx].rid,
+                        pre_verify_tokens[local_idx].numel(),
+                    )
+            pre_out_cache_loc = self._slice_out_cache_loc(out_cache_loc, pre_indices)
+            pre_result = self._verify_subset(
+                batch,
+                pre_indices,
+                pre_verify_tokens,
+                pre_out_cache_loc,
+                prefix_logits=(
+                    prefix_logits[pre_indices] if prefix_logits is not None else None
+                ),
+                prefix_logits_mask=(
+                    prefix_logits_mask[pre_indices]
+                    if prefix_logits_mask is not None
+                    else None
+                ),
+                next_window_tokens=draft_tokens[pre_indices],
+            )
+            if pre_result is not None:
+                logits_output = pre_result["logits_output"]
+                accept_length_list = pre_result["accept_length_list"]
+                for local_idx, batch_idx in enumerate(pre_indices):
+                    accept_length_list_full[batch_idx] = accept_length_list[local_idx]
+                self._record_out_cache_segments(
+                    out_cache_segments,
+                    pre_indices,
+                    pre_result["sub_batch"].out_cache_loc,
+                    accept_length_list,
+                )
+
+            for idx in post_indices:
+                req = batch.reqs[idx]
+                if not getattr(req, "pre_verify", True) and not req.finished():
+                    req.pearl_prev_window = draft_tokens[idx]
+            can_run_cuda_graph = False
+        else:
+            post_verify_only = not pre_indices
             verify_tokens = []
-            for i, req in enumerate(batch.reqs):
-                prev_window = getattr(req, "pearl_prev_window", None)
-                if not getattr(req, "pre_verify", True) and prev_window is not None:
+            draft_tokens = None
+            if post_verify_only:
+                for req in batch.reqs:
+                    prev_window = req.pearl_prev_window
                     verify_tokens.append(prev_window.to(self.device))
                     if _PEARL_DEBUG:
                         logger.info(
@@ -525,75 +751,120 @@ class PearlWorker:
                             req.rid,
                             prev_window.numel(),
                         )
-                else:
-                    verify_tokens.append(draft_tokens[i])
-                    if _PEARL_DEBUG:
-                        logger.info(
-                            "PEARL verify window req=%s mode=%s current_window_len=%d",
-                            req.rid,
-                            "pre" if getattr(req, "pre_verify", True) else "post",
-                            draft_tokens[i].numel(),
-                        )
-            verify_tokens = torch.stack(verify_tokens, dim=0)
+                verify_tokens = torch.stack(verify_tokens, dim=0)
+            else:
+                draft_tokens = draft_future.result()
+                if self.target_vocab_size:
+                    draft_tokens = torch.where(
+                        draft_tokens < self.target_vocab_size,
+                        draft_tokens,
+                        torch.zeros_like(draft_tokens),
+                    )
+                if draft_tokens.device != self.device:
+                    draft_tokens = draft_tokens.to(self.device, non_blocking=True)
 
-        batch.out_cache_loc = out_cache_loc
-        batch.input_ids = verify_tokens.reshape(-1)
-        if pre_indices:
-            prefix_logits = torch.zeros(
-                (batch.batch_size(), self.target_vocab_size),
-                dtype=pre_logits.dtype,
-                device=pre_logits.device,
-            )
-            prefix_logits_mask = torch.zeros(
-                (batch.batch_size(),), dtype=torch.bool, device=pre_logits.device
-            )
-            for row, idx in enumerate(pre_indices):
-                prefix_logits[idx] = pre_logits[row]
-                prefix_logits_mask[idx] = True
+                for i, req in enumerate(batch.reqs):
+                    prev_window = getattr(req, "pearl_prev_window", None)
+                    if not getattr(req, "pre_verify", True) and prev_window is not None:
+                        verify_tokens.append(prev_window.to(self.device))
+                        if _PEARL_DEBUG:
+                            logger.info(
+                                "PEARL verify window req=%s mode=post prev_window_len=%d",
+                                req.rid,
+                                prev_window.numel(),
+                            )
+                    else:
+                        verify_tokens.append(draft_tokens[i])
+                        if _PEARL_DEBUG:
+                            logger.info(
+                                "PEARL verify window req=%s mode=%s current_window_len=%d",
+                                req.rid,
+                                "pre" if getattr(req, "pre_verify", True) else "post",
+                                draft_tokens[i].numel(),
+                            )
+                verify_tokens = torch.stack(verify_tokens, dim=0)
 
-        spec_info = PearlVerifyInput(
-            batch.input_ids,
-            custom_mask,
-            positions,
+            batch.out_cache_loc = out_cache_loc
+            batch.input_ids = verify_tokens.reshape(-1)
+            spec_info = PearlVerifyInput(
+                batch.input_ids,
+                self._build_custom_mask(batch),
+                self._build_positions(batch),
+                self.speculative_num_draft_tokens,
+                self.target_vocab_size,
+                next_window_tokens=draft_tokens if not post_verify_only else None,
+                prefix_logits=prefix_logits,
+                prefix_logits_mask=prefix_logits_mask,
+            )
+            batch.spec_info = spec_info
+
+            model_worker_batch = batch.get_model_worker_batch()
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
+
+            logits_output, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.can_run_cuda_graph,
+            )
+            (
+                logits_output,
+                _verified_id,
+                _num_accepted_tokens,
+                accept_length_list,
+            ) = spec_info.verify(batch, logits_output, self.page_size)
+            accept_length_list_full = accept_length_list
+            self._record_out_cache_segments(
+                out_cache_segments,
+                list(range(batch.batch_size())),
+                batch.out_cache_loc,
+                accept_length_list,
+            )
+
+            if post_verify_only:
+                draft_tokens = draft_future.result()
+                if self.target_vocab_size:
+                    draft_tokens = torch.where(
+                        draft_tokens < self.target_vocab_size,
+                        draft_tokens,
+                        torch.zeros_like(draft_tokens),
+                    )
+                if draft_tokens.device != self.device:
+                    draft_tokens = draft_tokens.to(self.device, non_blocking=True)
+                for i, req in enumerate(batch.reqs):
+                    if not getattr(req, "pre_verify", True) and not req.finished():
+                        req.pearl_prev_window = draft_tokens[i]
+
+        new_seq_lens_cpu = torch.tensor(
+            [
+                len(req.origin_input_ids) + len(req.output_ids)
+                for req in batch.reqs
+            ],
+            dtype=torch.int64,
+        )
+        batch.seq_lens_cpu = new_seq_lens_cpu
+        batch.seq_lens = new_seq_lens_cpu.to(self.device, non_blocking=True)
+
+        if all(segment is not None for segment in out_cache_segments):
+            batch.out_cache_loc = torch.cat(out_cache_segments, dim=0)
+
+        spec_info_full = PearlVerifyInput(
+            torch.zeros(
+                (batch.batch_size() * self.speculative_num_draft_tokens,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            self._build_custom_mask(batch),
+            self._build_positions(batch),
             self.speculative_num_draft_tokens,
             self.target_vocab_size,
-            next_window_tokens=draft_tokens if not post_verify_only else None,
-            prefix_logits=prefix_logits,
-            prefix_logits_mask=prefix_logits_mask,
         )
-        batch.spec_info = spec_info
-
-        model_worker_batch = batch.get_model_worker_batch()
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+        spec_info_full.accept_length = torch.tensor(
+            accept_length_list_full, dtype=torch.int32, device=self.device
         )
+        batch.spec_info = spec_info_full
 
-        logits_output, can_run_cuda_graph = (
-            batch_result.logits_output,
-            batch_result.can_run_cuda_graph,
-        )
-        (
-            logits_output,
-            verified_id,
-            num_accepted_tokens,
-            accept_length_list,
-        ) = spec_info.verify(batch, logits_output, self.page_size)
-
-        if post_verify_only:
-            draft_tokens = draft_future.result()
-            if self.target_vocab_size:
-                draft_tokens = torch.where(
-                    draft_tokens < self.target_vocab_size,
-                    draft_tokens,
-                    torch.zeros_like(draft_tokens),
-                )
-            if draft_tokens.device != self.device:
-                draft_tokens = draft_tokens.to(self.device, non_blocking=True)
-            for i, req in enumerate(batch.reqs):
-                if not getattr(req, "pre_verify", True) and not req.finished():
-                    req.pearl_prev_window = draft_tokens[i]
-
-        self._recompute_revised_kv(batch, spec_info)
+        self._recompute_revised_kv(batch, spec_info_full)
         self.draft_worker.update_after_verify(batch.reqs)
 
         batch.forward_mode = ForwardMode.DECODE
@@ -601,11 +872,14 @@ class PearlWorker:
             if req.finished():
                 self.draft_worker.release_req(req)
 
+        next_token_ids = self._build_last_token_ids(batch)
+        num_accepted_tokens = int(sum(accept_length_list_full)) + batch.batch_size()
+
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=verified_id,
+            next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_list,
+            accept_length_per_req_cpu=accept_length_list_full,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
@@ -695,6 +969,7 @@ class PearlWorker:
             spec_info=None,
             hicache_consumer_index=-1,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            disable_cuda_graph=True,
             is_prefill_only=False,
             dimensions=None,
             dllm_block_offsets=None,

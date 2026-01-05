@@ -371,6 +371,8 @@ class ForwardBatch:
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    # Force disabling CUDA graph for this batch.
+    disable_cuda_graph: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
@@ -434,6 +436,7 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
+            disable_cuda_graph=batch.disable_cuda_graph,
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
