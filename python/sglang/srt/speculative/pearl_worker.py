@@ -165,8 +165,36 @@ class PearlWorker:
         buckets = sorted(set(buckets))
         profile_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_PROFILE_STEPS", "12"))
         skip_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_SKIP_STEPS", "2"))
-        max_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MAX", "16"))
-        steps_mult = float(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MULT", "1.0"))
+        auto_steps = (
+            (self.server_args.speculative_auto_steps or "").strip()
+            or os.environ.get("SGLANG_PEARL_AUTO_STEPS", "").strip()
+        )
+        max_steps = None
+        steps_mult = None
+        if auto_steps:
+            for chunk in auto_steps.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                if "=" not in chunk:
+                    raise ValueError(
+                        "PEARL auto steps must use key=value pairs, got %r" % chunk
+                    )
+                key, value = chunk.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "max":
+                    max_steps = int(value)
+                elif key == "mult":
+                    steps_mult = float(value)
+                else:
+                    raise ValueError(
+                        "PEARL auto steps unknown key %r (use max, mult)" % key
+                    )
+        if max_steps is None:
+            max_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MAX", "8"))
+        if steps_mult is None:
+            steps_mult = float(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MULT", "4.0"))
         max_steps = max(1, max_steps)
         if steps_mult <= 0:
             raise ValueError("PEARL auto steps multiplier must be positive.")

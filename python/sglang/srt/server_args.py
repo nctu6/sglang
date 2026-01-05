@@ -421,6 +421,7 @@ class ServerArgs:
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
+    speculative_auto_steps: Optional[str] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
@@ -3419,6 +3420,15 @@ class ServerArgs:
                 "For PEARL, use -1 to auto-tune based on draft/target speed."
             ),
             default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-auto-steps",
+            type=str,
+            help=(
+                "PEARL auto-tune settings in key=value pairs, e.g. 'max=8,mult=4.0'. "
+                "Overrides SGLANG_PEARL_AUTO_STEPS."
+            ),
+            default=ServerArgs.speculative_auto_steps,
         )
         parser.add_argument(
             "--speculative-eagle-topk",
