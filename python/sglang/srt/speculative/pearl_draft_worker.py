@@ -1,6 +1,7 @@
 import copy
 import logging
 import os
+import threading
 from typing import Dict, Optional
 
 import torch
@@ -16,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.mem_cache.common import write_cache_indices
 from sglang.srt.utils import empty_context
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,7 @@ class PearlDraftWorker:
         self._cache_indices: Dict[str, torch.Tensor] = {}
         self._req_pool_map: Dict[int, int] = {}
         self._draft_buffers: Dict[str, list[int]] = {}
+        self._lock = threading.Lock()
 
     def clear_cache_pool(self):
         # Allocator is shared with target worker.
@@ -117,17 +120,18 @@ class PearlDraftWorker:
                 self._draft_buffers[rid] = buffer[:num_tokens]
 
     def release_req(self, req):
-        rid = req.rid
-        target_req_pool_idx = req.req_pool_idx
-        if target_req_pool_idx in self._req_pool_map:
-            draft_idx = self._req_pool_map.pop(target_req_pool_idx)
-            self.req_to_token_pool.free(draft_idx)
+        with self._lock:
+            rid = req.rid
+            target_req_pool_idx = req.req_pool_idx
+            if target_req_pool_idx in self._req_pool_map:
+                draft_idx = self._req_pool_map.pop(target_req_pool_idx)
+                self.req_to_token_pool.free(draft_idx)
 
-        indices = self._cache_indices.pop(rid, None)
-        if indices is not None and indices.numel() > 0:
-            self.token_to_kv_pool_allocator.free(indices)
-        self._cache_lens.pop(rid, None)
-        self._draft_buffers.pop(rid, None)
+            indices = self._cache_indices.pop(rid, None)
+            if indices is not None and indices.numel() > 0:
+                self.token_to_kv_pool_allocator.free(indices)
+            self._cache_lens.pop(rid, None)
+            self._draft_buffers.pop(rid, None)
 
     def _build_sampling_info(self, reqs):
         class _DummyBatch:
@@ -244,293 +248,419 @@ class PearlDraftWorker:
         if max_missing == 0:
             return
 
-        req_pool_indices_tensor = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+        if getattr(self.token_to_kv_pool_allocator, "page_size", 1) != 1:
+            # Fallback to per-token sync for paged cache.
+            req_pool_indices_tensor = torch.tensor(
+                req_pool_indices, dtype=torch.int64, device=self.device
+            )
+            for step in range(max_missing):
+                active = [
+                    i for i, tokens in enumerate(missing_tokens) if len(tokens) > step
+                ]
+                if not active:
+                    break
+
+                active_req_pool = req_pool_indices_tensor[active]
+                input_ids = torch.tensor(
+                    [missing_tokens[i][step] for i in active],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                step_seq_lens = torch.tensor(
+                    [base_lens[i] + step for i in active],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                step_seq_lens_cpu = torch.tensor(
+                    [base_lens[i] + step for i in active],
+                    dtype=torch.int64,
+                )
+                out_cache_loc = self.token_to_kv_pool_allocator.alloc(len(active))
+                if out_cache_loc is None:
+                    raise RuntimeError("Draft KV cache allocation failed.")
+                self.req_to_token_pool.write(
+                    (active_req_pool, step_seq_lens), out_cache_loc.to(torch.int32)
+                )
+                for idx, req_idx in enumerate(active):
+                    rid = batch.reqs[req_idx].rid
+                    cached_indices = self._cache_indices.get(
+                        rid, torch.empty((0,), dtype=torch.int64, device=self.device)
+                    )
+                    self._cache_indices[rid] = torch.cat(
+                        [cached_indices, out_cache_loc[idx : idx + 1]], dim=0
+                    )
+                    self._cache_lens[rid] = base_lens[req_idx] + step + 1
+
+                sampling_info = self._build_sampling_info(
+                    [batch.reqs[i] for i in active]
+                )
+                model_worker_batch = ModelWorkerBatch(
+                    forward_mode=ForwardMode.DECODE,
+                    input_ids=input_ids,
+                    req_pool_indices=active_req_pool,
+                    seq_lens=step_seq_lens,
+                    out_cache_loc=out_cache_loc,
+                    seq_lens_cpu=step_seq_lens_cpu,
+                    seq_lens_sum=int(step_seq_lens.sum().item()),
+                    return_logprob=False,
+                    top_logprobs_nums=None,
+                    token_ids_logprobs=None,
+                    global_num_tokens=None,
+                    global_num_tokens_for_logprob=None,
+                    is_extend_in_batch=False,
+                    can_run_dp_cuda_graph=False,
+                    tbo_split_seq_index=None,
+                    global_forward_mode=None,
+                    extend_num_tokens=None,
+                    extend_seq_lens=None,
+                    extend_prefix_lens=None,
+                    extend_logprob_start_lens=None,
+                    extend_input_logprob_token_ids=None,
+                    multimodal_inputs=[batch.reqs[i].multimodal_inputs for i in active],
+                    encoder_cached=None,
+                    encoder_lens=None,
+                    encoder_lens_cpu=None,
+                    encoder_out_cache_loc=None,
+                    lora_ids=[batch.reqs[i].lora_id for i in active],
+                    sampling_info=sampling_info,
+                    input_embeds=None,
+                    token_type_ids=None,
+                    spec_algorithm=None,
+                    spec_info=None,
+                    hicache_consumer_index=-1,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    is_prefill_only=False,
+                    dimensions=None,
+                    dllm_block_offsets=None,
+                    dllm_config=None,
+                    reqs=[batch.reqs[i] for i in active],
+                    has_grammar=False,
+                    mamba_track_indices=None,
+                    mamba_track_mask=None,
+                    mamba_track_seqlens=None,
+                )
+
+                self.draft_worker.forward_batch_generation(
+                    model_worker_batch, is_verify=True
+                )
+            return
+
+        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        req_pool_indices_device = req_pool_indices_cpu.to(
+            self.device, non_blocking=True
         )
-        for step in range(max_missing):
-            active = [
-                i for i, tokens in enumerate(missing_tokens) if len(tokens) > step
-            ]
-            if not active:
-                break
+        prefix_lens_cpu = torch.tensor(base_lens, dtype=torch.int64)
+        extend_lens_cpu = torch.tensor(
+            [len(tokens) for tokens in missing_tokens], dtype=torch.int64
+        )
+        seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
+        total_missing = int(extend_lens_cpu.sum().item())
+        if total_missing <= 0:
+            return
 
-            active_req_pool = req_pool_indices_tensor[active]
-            input_ids = torch.tensor(
-                [missing_tokens[i][step] for i in active],
-                dtype=torch.int64,
-                device=self.device,
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(total_missing)
+        if out_cache_loc is None:
+            raise RuntimeError("Draft KV cache allocation failed.")
+
+        prefix_tensors = [
+            self._cache_indices.get(
+                batch.reqs[i].rid,
+                torch.empty((0,), dtype=torch.int64, device=self.device),
             )
-            step_seq_lens = torch.tensor(
-                [base_lens[i] + step for i in active],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            step_seq_lens_cpu = torch.tensor(
-                [base_lens[i] + step for i in active],
-                dtype=torch.int64,
-            )
-            out_cache_loc = self.token_to_kv_pool_allocator.alloc(len(active))
-            if out_cache_loc is None:
-                raise RuntimeError("Draft KV cache allocation failed.")
-            self.req_to_token_pool.write(
-                (active_req_pool, step_seq_lens), out_cache_loc.to(torch.int32)
-            )
-            for idx, req_idx in enumerate(active):
-                rid = batch.reqs[req_idx].rid
-                cached_indices = self._cache_indices.get(
-                    rid, torch.empty((0,), dtype=torch.int64, device=self.device)
-                )
-                self._cache_indices[rid] = torch.cat(
-                    [cached_indices, out_cache_loc[idx : idx + 1]], dim=0
-                )
-                self._cache_lens[rid] = base_lens[req_idx] + step + 1
+            for i in range(len(batch.reqs))
+        ]
 
-            sampling_info = self._build_sampling_info([batch.reqs[i] for i in active])
-            model_worker_batch = ModelWorkerBatch(
-                forward_mode=ForwardMode.DECODE,
-                input_ids=input_ids,
-                req_pool_indices=active_req_pool,
-                seq_lens=step_seq_lens,
-                out_cache_loc=out_cache_loc,
-                seq_lens_cpu=step_seq_lens_cpu,
-                seq_lens_sum=int(step_seq_lens.sum().item()),
-                return_logprob=False,
-                top_logprobs_nums=None,
-                token_ids_logprobs=None,
-                global_num_tokens=None,
-                global_num_tokens_for_logprob=None,
-                is_extend_in_batch=False,
-                can_run_dp_cuda_graph=False,
-                tbo_split_seq_index=None,
-                global_forward_mode=None,
-                extend_num_tokens=None,
-                extend_seq_lens=None,
-                extend_prefix_lens=None,
-                extend_logprob_start_lens=None,
-                extend_input_logprob_token_ids=None,
-                multimodal_inputs=[batch.reqs[i].multimodal_inputs for i in active],
-                encoder_cached=None,
-                encoder_lens=None,
-                encoder_lens_cpu=None,
-                encoder_out_cache_loc=None,
-                lora_ids=[batch.reqs[i].lora_id for i in active],
-                sampling_info=sampling_info,
-                input_embeds=None,
-                token_type_ids=None,
-                spec_algorithm=None,
-                spec_info=None,
-                hicache_consumer_index=-1,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                is_prefill_only=False,
-                dimensions=None,
-                dllm_block_offsets=None,
-                dllm_config=None,
-                reqs=[batch.reqs[i] for i in active],
-                has_grammar=False,
-                mamba_track_indices=None,
-                mamba_track_mask=None,
-                mamba_track_seqlens=None,
-            )
+        prefix_lens_device = prefix_lens_cpu.to(self.device, non_blocking=True)
+        extend_lens_device = extend_lens_cpu.to(self.device, non_blocking=True)
+        seq_lens_device = seq_lens_cpu.to(self.device, non_blocking=True)
 
-            self.draft_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
-            )
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            seq_lens_device,
+            seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            self.req_to_token_pool,
+        )
 
-    def update_after_verify(self, reqs):
-        for req in reqs:
-            rid = req.rid
-            buffer = self._draft_buffers.get(rid, [])
-            accept_count = getattr(req, "pearl_accept_count", 0)
-            reject_pos = getattr(req, "pearl_reject_pos", None)
-            used_revised = getattr(req, "pearl_used_revised", False)
-
-            if used_revised or reject_pos is not None:
-                buffer = []
-            elif accept_count > 0:
-                buffer = buffer[accept_count:]
-
-            self._draft_buffers[rid] = buffer
-
-            target_len = len(req.origin_input_ids) + len(req.output_ids)
-            desired_len = target_len + len(buffer)
-            cached_len = self._cache_lens.get(rid, 0)
-            cached_indices = self._cache_indices.get(
-                rid, torch.empty((0,), dtype=torch.int64, device=self.device)
-            )
-            if cached_len > desired_len:
-                to_free = cached_indices[desired_len:]
-                if to_free.numel() > 0:
-                    self.token_to_kv_pool_allocator.free(to_free)
-                cached_indices = cached_indices[:desired_len]
-                cached_len = desired_len
-
-            self._cache_indices[rid] = cached_indices
-            self._cache_lens[rid] = cached_len
-
-    def run_draft(self, batch: ScheduleBatch):
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.model_runner.gpu_id)
-        bs = batch.batch_size()
-        draft_tokens = []
-
-        self._sync_cache(batch)
-        if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
-
-        req_pool_indices = torch.tensor(
-            [self._req_pool_map[int(idx.item())] for idx in batch.req_pool_indices],
+        input_ids = torch.tensor(
+            [token for tokens in missing_tokens for token in tokens],
             dtype=torch.int64,
             device=self.device,
         )
-        max_reqs = self.req_to_token_pool.req_to_token.shape[0]
-        max_context_len = self.req_to_token_pool.req_to_token.shape[1]
-        if req_pool_indices.numel() and int(req_pool_indices.max().item()) >= max_reqs:
-            raise RuntimeError(
-                "Draft req_pool_indices out of range: max=%d size=%d"
-                % (int(req_pool_indices.max().item()), max_reqs)
-            )
-        buffers = {
-            req.rid: list(self._draft_buffers.get(req.rid, [])) for req in batch.reqs
-        }
-        current_tokens = {}
-        for req in batch.reqs:
-            buffer = buffers[req.rid]
-            if buffer:
-                current_tokens[req.rid] = buffer[-1]
-            else:
-                current_tokens[req.rid] = (
-                    req.output_ids[-1]
-                    if req.output_ids
-                    else req.origin_input_ids[-1]
-                )
 
         sampling_info = self._build_sampling_info(batch.reqs)
-        for _ in range(self.speculative_num_draft_tokens):
-            active = [
-                i
-                for i, req in enumerate(batch.reqs)
-                if len(buffers[req.rid]) < self.speculative_num_draft_tokens
-            ]
-            if not active:
-                break
+        model_worker_batch = ModelWorkerBatch(
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices_device,
+            seq_lens=seq_lens_device,
+            out_cache_loc=out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            global_num_tokens=None,
+            global_num_tokens_for_logprob=None,
+            is_extend_in_batch=False,
+            can_run_dp_cuda_graph=False,
+            tbo_split_seq_index=None,
+            global_forward_mode=None,
+            extend_num_tokens=total_missing,
+            extend_seq_lens=extend_lens_cpu.tolist(),
+            extend_prefix_lens=prefix_lens_cpu.tolist(),
+            extend_logprob_start_lens=None,
+            extend_input_logprob_token_ids=None,
+            multimodal_inputs=[req.multimodal_inputs for req in batch.reqs],
+            encoder_cached=None,
+            encoder_lens=None,
+            encoder_lens_cpu=None,
+            encoder_out_cache_loc=None,
+            lora_ids=[req.lora_id for req in batch.reqs],
+            sampling_info=sampling_info,
+            input_embeds=None,
+            token_type_ids=None,
+            spec_algorithm=None,
+            spec_info=None,
+            hicache_consumer_index=-1,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            is_prefill_only=False,
+            dimensions=None,
+            dllm_block_offsets=None,
+            dllm_config=None,
+            reqs=list(batch.reqs),
+            has_grammar=False,
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            mamba_track_seqlens=None,
+        )
 
-            active_req_pool = req_pool_indices[active]
-            input_ids = torch.tensor(
-                [current_tokens[batch.reqs[i].rid] for i in active],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            sampling_info_active = sampling_info
-            if len(active) != bs:
-                sampling_info_active = copy.deepcopy(sampling_info)
-                keep_indices_device = torch.tensor(active, device=self.device)
-                sampling_info_active.filter_batch(active, keep_indices_device)
-            step_seq_lens = torch.tensor(
-                [self._cache_lens[batch.reqs[i].rid] for i in active],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            if int(step_seq_lens.max().item()) >= max_context_len:
-                raise RuntimeError(
-                    "Draft seq_lens exceed context: max=%d limit=%d"
-                    % (int(step_seq_lens.max().item()), max_context_len)
-                )
-            step_seq_lens_cpu = step_seq_lens.cpu()
-            step_seq_lens_sum = int(step_seq_lens.sum().item())
+        self.draft_worker.forward_batch_generation(model_worker_batch, is_verify=True)
 
-            step_out_cache_loc = self.token_to_kv_pool_allocator.alloc(len(active))
-            if step_out_cache_loc is None:
-                raise RuntimeError("Draft KV cache allocation failed.")
-            self.req_to_token_pool.write(
-                (active_req_pool, step_seq_lens),
-                step_out_cache_loc.to(torch.int32),
+        cursor = 0
+        for i, req in enumerate(batch.reqs):
+            extend_len = int(extend_lens_cpu[i].item())
+            if extend_len <= 0:
+                continue
+            rid = req.rid
+            new_indices = out_cache_loc[cursor : cursor + extend_len]
+            cached_indices = self._cache_indices.get(
+                rid, torch.empty((0,), dtype=torch.int64, device=self.device)
             )
+            self._cache_indices[rid] = torch.cat(
+                [cached_indices, new_indices], dim=0
+            )
+            self._cache_lens[rid] = int(seq_lens_cpu[i].item())
+            cursor += extend_len
 
-            model_worker_batch = ModelWorkerBatch(
-                forward_mode=ForwardMode.DECODE,
-                input_ids=input_ids,
-                req_pool_indices=active_req_pool,
-                seq_lens=step_seq_lens,
-                out_cache_loc=step_out_cache_loc,
-                seq_lens_cpu=step_seq_lens_cpu,
-                seq_lens_sum=step_seq_lens_sum,
-                return_logprob=False,
-                top_logprobs_nums=None,
-                token_ids_logprobs=None,
-                global_num_tokens=None,
-                global_num_tokens_for_logprob=None,
-                is_extend_in_batch=False,
-                can_run_dp_cuda_graph=False,
-                tbo_split_seq_index=None,
-                global_forward_mode=None,
-                extend_num_tokens=None,
-                extend_seq_lens=None,
-                extend_prefix_lens=None,
-                extend_logprob_start_lens=None,
-                extend_input_logprob_token_ids=None,
-                multimodal_inputs=[batch.reqs[i].multimodal_inputs for i in active],
-                encoder_cached=None,
-                encoder_lens=None,
-                encoder_lens_cpu=None,
-                encoder_out_cache_loc=None,
-                lora_ids=[batch.reqs[i].lora_id for i in active],
-                sampling_info=sampling_info_active,
-                input_embeds=None,
-                token_type_ids=None,
-                spec_algorithm=None,
-                spec_info=None,
-                hicache_consumer_index=-1,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                is_prefill_only=False,
-                dimensions=None,
-                dllm_block_offsets=None,
-                dllm_config=None,
-                reqs=[batch.reqs[i] for i in active],
-                has_grammar=False,
-                mamba_track_indices=None,
-                mamba_track_mask=None,
-                mamba_track_seqlens=None,
-            )
 
-            batch_result = self.draft_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
-            )
-            if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
-                torch.cuda.synchronize(self.device)
-            logits_output = batch_result.logits_output
-            logits = logits_output.next_token_logits
-            if sampling_info_active.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits, sampling_info_active, num_tokens_in_batch=1
-                )
-            if sampling_info_active.penalizer_orchestrator is not None:
-                sampling_info_active.apply_logits_bias(logits)
-            temperatures = (
-                sampling_info_active.temperatures.view(-1)
-                .to(logits.device)
-                .clamp(min=1e-5)
-            )
-            logits = logits / temperatures.unsqueeze(1)
-            next_tokens = torch.argmax(logits, dim=-1)
+    def update_after_verify(self, reqs):
+        with self._lock:
+            for req in reqs:
+                rid = req.rid
+                buffer = self._draft_buffers.get(rid, [])
+                accept_count = getattr(req, "pearl_accept_count", 0)
+                reject_pos = getattr(req, "pearl_reject_pos", None)
+                used_revised = getattr(req, "pearl_used_revised", False)
 
-            for idx, req_idx in enumerate(active):
-                rid = batch.reqs[req_idx].rid
-                token = int(next_tokens[idx].item())
-                buffers[rid].append(token)
-                current_tokens[rid] = token
+                if used_revised or reject_pos is not None:
+                    buffer = []
+                elif accept_count > 0:
+                    buffer = buffer[accept_count:]
+
+                self._draft_buffers[rid] = buffer
+
+                target_len = len(req.origin_input_ids) + len(req.output_ids)
+                desired_len = target_len + len(buffer)
+                cached_len = self._cache_lens.get(rid, 0)
                 cached_indices = self._cache_indices.get(
                     rid, torch.empty((0,), dtype=torch.int64, device=self.device)
                 )
-                self._cache_indices[rid] = torch.cat(
-                    [cached_indices, step_out_cache_loc[idx : idx + 1]], dim=0
+                if cached_len > desired_len:
+                    to_free = cached_indices[desired_len:]
+                    if to_free.numel() > 0:
+                        self.token_to_kv_pool_allocator.free(to_free)
+                    cached_indices = cached_indices[:desired_len]
+                    cached_len = desired_len
+
+                self._cache_indices[rid] = cached_indices
+                self._cache_lens[rid] = cached_len
+
+    def run_draft(self, batch: ScheduleBatch):
+        with self._lock:
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.model_runner.gpu_id)
+            bs = batch.batch_size()
+            draft_tokens = []
+
+            self._sync_cache(batch)
+            if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+
+            req_pool_indices = torch.tensor(
+                [self._req_pool_map[int(idx.item())] for idx in batch.req_pool_indices],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            max_reqs = self.req_to_token_pool.req_to_token.shape[0]
+            max_context_len = self.req_to_token_pool.req_to_token.shape[1]
+            if (
+                req_pool_indices.numel()
+                and int(req_pool_indices.max().item()) >= max_reqs
+            ):
+                raise RuntimeError(
+                    "Draft req_pool_indices out of range: max=%d size=%d"
+                    % (int(req_pool_indices.max().item()), max_reqs)
                 )
-                self._cache_lens[rid] = self._cache_lens.get(rid, 0) + 1
+            buffers = {
+                req.rid: list(self._draft_buffers.get(req.rid, []))
+                for req in batch.reqs
+            }
+            current_tokens = {}
+            for req in batch.reqs:
+                buffer = buffers[req.rid]
+                if buffer:
+                    current_tokens[req.rid] = buffer[-1]
+                else:
+                    current_tokens[req.rid] = (
+                        req.output_ids[-1]
+                        if req.output_ids
+                        else req.origin_input_ids[-1]
+                    )
 
-        for req in batch.reqs:
-            buffer = buffers[req.rid]
-            self._draft_buffers[req.rid] = buffer
-            draft_tokens.append(buffer[: self.speculative_num_draft_tokens])
+            sampling_info = self._build_sampling_info(batch.reqs)
+            for _ in range(self.speculative_num_draft_tokens):
+                active = [
+                    i
+                    for i, req in enumerate(batch.reqs)
+                    if len(buffers[req.rid]) < self.speculative_num_draft_tokens
+                ]
+                if not active:
+                    break
 
-        if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
-        return torch.tensor(draft_tokens, dtype=torch.int64, device=self.device)
+                active_req_pool = req_pool_indices[active]
+                input_ids = torch.tensor(
+                    [current_tokens[batch.reqs[i].rid] for i in active],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                sampling_info_active = sampling_info
+                if len(active) != bs:
+                    sampling_info_active = copy.deepcopy(sampling_info)
+                    keep_indices_device = torch.tensor(active, device=self.device)
+                    sampling_info_active.filter_batch(active, keep_indices_device)
+                step_seq_lens = torch.tensor(
+                    [self._cache_lens[batch.reqs[i].rid] for i in active],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                if int(step_seq_lens.max().item()) >= max_context_len:
+                    raise RuntimeError(
+                        "Draft seq_lens exceed context: max=%d limit=%d"
+                        % (int(step_seq_lens.max().item()), max_context_len)
+                    )
+                step_seq_lens_cpu = step_seq_lens.cpu()
+                step_seq_lens_sum = int(step_seq_lens.sum().item())
+
+                step_out_cache_loc = self.token_to_kv_pool_allocator.alloc(len(active))
+                if step_out_cache_loc is None:
+                    raise RuntimeError("Draft KV cache allocation failed.")
+                self.req_to_token_pool.write(
+                    (active_req_pool, step_seq_lens),
+                    step_out_cache_loc.to(torch.int32),
+                )
+
+                model_worker_batch = ModelWorkerBatch(
+                    forward_mode=ForwardMode.DECODE,
+                    input_ids=input_ids,
+                    req_pool_indices=active_req_pool,
+                    seq_lens=step_seq_lens,
+                    out_cache_loc=step_out_cache_loc,
+                    seq_lens_cpu=step_seq_lens_cpu,
+                    seq_lens_sum=step_seq_lens_sum,
+                    return_logprob=False,
+                    top_logprobs_nums=None,
+                    token_ids_logprobs=None,
+                    global_num_tokens=None,
+                    global_num_tokens_for_logprob=None,
+                    is_extend_in_batch=False,
+                    can_run_dp_cuda_graph=False,
+                    tbo_split_seq_index=None,
+                    global_forward_mode=None,
+                    extend_num_tokens=None,
+                    extend_seq_lens=None,
+                    extend_prefix_lens=None,
+                    extend_logprob_start_lens=None,
+                    extend_input_logprob_token_ids=None,
+                    multimodal_inputs=[batch.reqs[i].multimodal_inputs for i in active],
+                    encoder_cached=None,
+                    encoder_lens=None,
+                    encoder_lens_cpu=None,
+                    encoder_out_cache_loc=None,
+                    lora_ids=[batch.reqs[i].lora_id for i in active],
+                    sampling_info=sampling_info_active,
+                    input_embeds=None,
+                    token_type_ids=None,
+                    spec_algorithm=None,
+                    spec_info=None,
+                    hicache_consumer_index=-1,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    is_prefill_only=False,
+                    dimensions=None,
+                    dllm_block_offsets=None,
+                    dllm_config=None,
+                    reqs=[batch.reqs[i] for i in active],
+                    has_grammar=False,
+                    mamba_track_indices=None,
+                    mamba_track_mask=None,
+                    mamba_track_seqlens=None,
+                )
+
+                batch_result = self.draft_worker.forward_batch_generation(
+                    model_worker_batch, is_verify=True
+                )
+                if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
+                logits_output = batch_result.logits_output
+                logits = logits_output.next_token_logits
+                if sampling_info_active.has_custom_logit_processor:
+                    apply_custom_logit_processor(
+                        logits, sampling_info_active, num_tokens_in_batch=1
+                    )
+                if sampling_info_active.penalizer_orchestrator is not None:
+                    sampling_info_active.apply_logits_bias(logits)
+                temperatures = (
+                    sampling_info_active.temperatures.view(-1)
+                    .to(logits.device)
+                    .clamp(min=1e-5)
+                )
+                logits = logits / temperatures.unsqueeze(1)
+                next_tokens = torch.argmax(logits, dim=-1)
+
+                for idx, req_idx in enumerate(active):
+                    rid = batch.reqs[req_idx].rid
+                    token = int(next_tokens[idx].item())
+                    buffers[rid].append(token)
+                    current_tokens[rid] = token
+                    cached_indices = self._cache_indices.get(
+                        rid, torch.empty((0,), dtype=torch.int64, device=self.device)
+                    )
+                    self._cache_indices[rid] = torch.cat(
+                        [cached_indices, step_out_cache_loc[idx : idx + 1]], dim=0
+                    )
+                    self._cache_lens[rid] = self._cache_lens.get(rid, 0) + 1
+
+            for req in batch.reqs:
+                buffer = buffers[req.rid]
+                self._draft_buffers[req.rid] = buffer
+                draft_tokens.append(buffer[: self.speculative_num_draft_tokens])
+
+            if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            return torch.tensor(draft_tokens, dtype=torch.int64, device=self.device)
