@@ -746,6 +746,8 @@ class PearlWorker:
         batch.spec_info = None
         graph_token_num = self._get_graph_token_num()
         out_cache_loc = self._allocate_draft_slots(batch, graph_token_num)
+        draft_start = time.perf_counter()
+        draft_elapsed = None
         draft_future = self._draft_executor.submit(self.draft_worker.run_draft, batch)
 
         post_indices = []
@@ -840,6 +842,7 @@ class PearlWorker:
                 )
 
             draft_tokens = draft_future.result()
+            draft_elapsed = time.perf_counter() - draft_start
             if self.target_vocab_size:
                 draft_tokens = torch.where(
                     draft_tokens < self.target_vocab_size,
@@ -917,6 +920,7 @@ class PearlWorker:
                 )
             else:
                 draft_tokens = draft_future.result()
+                draft_elapsed = time.perf_counter() - draft_start
                 if self.target_vocab_size:
                     draft_tokens = torch.where(
                         draft_tokens < self.target_vocab_size,
@@ -992,6 +996,7 @@ class PearlWorker:
 
             if post_verify_only:
                 draft_tokens = draft_future.result()
+                draft_elapsed = time.perf_counter() - draft_start
                 if self.target_vocab_size:
                     draft_tokens = torch.where(
                         draft_tokens < self.target_vocab_size,
@@ -1037,6 +1042,17 @@ class PearlWorker:
                 len(accept_length_list_full) * max(self.speculative_num_steps, 1)
             )
             self._update_adaptive_steps(accept_rate)
+            avg_accept = sum(accept_length_list_full) / len(accept_length_list_full)
+            logger.info(
+                "PEARL batch stats: bs=%d pre=%d post=%d steps=%d accept_rate=%.3f avg_accept=%.2f draft_ms=%.2f",
+                batch.batch_size(),
+                len(pre_indices),
+                len(post_indices),
+                self.speculative_num_steps,
+                accept_rate,
+                avg_accept,
+                (draft_elapsed or 0.0) * 1000.0,
+            )
 
         self._recompute_revised_kv(batch, spec_info_full)
         self.draft_worker.update_after_verify(batch.reqs)

@@ -211,8 +211,6 @@ class PearlVerifyInput(SpecInput):
         )
         scaled_logits = aligned_logits.reshape(bs * self.draft_token_num, -1) / temperatures
         probs = torch.softmax(scaled_logits, dim=-1)
-        target_prob = probs.gather(1, self.draft_token.unsqueeze(1)).squeeze(1)
-        target_prob = target_prob.view(bs, self.draft_token_num)
         probs_view = probs.view(bs, self.draft_token_num, -1)
 
         accepted_indices = []
@@ -220,7 +218,9 @@ class PearlVerifyInput(SpecInput):
         accept_length_list = []
         has_finished = False
 
-        coins = torch.rand_like(target_prob)
+        coins = torch.rand(
+            (bs, self.draft_token_num), dtype=probs.dtype, device=self.device
+        )
         valid_lens = (
             self.valid_draft_lens.tolist()
             if self.valid_draft_lens is not None
@@ -240,6 +240,38 @@ class PearlVerifyInput(SpecInput):
             used_revised_token = False
             revised_offset = None
             req.pearl_revised_token = None
+            target_prob0 = 0.0
+
+            def _apply_sampling_filters(
+                probs_row: torch.Tensor,
+                top_k: int,
+                top_p: float,
+                min_p: float,
+            ) -> torch.Tensor:
+                filtered = probs_row
+                vocab_size = filtered.numel()
+                if top_k > 0 and top_k < vocab_size:
+                    topk_vals, topk_idx = torch.topk(filtered, top_k)
+                    filtered = torch.zeros_like(filtered)
+                    filtered.scatter_(0, topk_idx, topk_vals)
+                if top_p < 1.0:
+                    sorted_probs, sorted_idx = torch.sort(filtered, descending=True)
+                    cdf = torch.cumsum(sorted_probs, dim=-1)
+                    mask = cdf <= top_p
+                    if mask.numel() > 0:
+                        mask[0] = True
+                    sorted_probs = sorted_probs * mask
+                    filtered = torch.zeros_like(filtered).scatter_(
+                        0, sorted_idx, sorted_probs
+                    )
+                if min_p > 0.0:
+                    filtered = torch.where(
+                        filtered >= min_p, filtered, torch.zeros_like(filtered)
+                    )
+                norm = filtered.sum()
+                if norm > 0:
+                    filtered = filtered / norm
+                return filtered
 
             if valid_len <= 0:
                 tokens_to_append = []
@@ -247,14 +279,21 @@ class PearlVerifyInput(SpecInput):
                 accept_count = 0
                 req.pre_verify = True
             elif pre_verify:
-                if coins[i, 0] <= target_prob[i, 0]:
+                probs_row = probs_view[i, 0].clone()
+                probs_row = _apply_sampling_filters(
+                    probs_row,
+                    int(sampling_info.top_ks[i].item()),
+                    float(sampling_info.top_ps[i].item()),
+                    float(sampling_info.min_ps[i].item()),
+                )
+                draft_token_id = draft_tokens[i, 0].item()
+                target_prob0 = float(probs_row[draft_token_id].item())
+                if coins[i, 0] <= target_prob0:
                     tokens_to_append = [draft_tokens[i, 0].item()]
                     tokens_for_kv = tokens_to_append
                     accept_count = 1
                     req.pre_verify = False
                 else:
-                    draft_token_id = draft_tokens[i, 0].item()
-                    probs_row = probs_view[i, 0].clone()
                     probs_row[draft_token_id] = 0.0
                     norm = probs_row.sum()
                     if norm > 0:
@@ -284,7 +323,15 @@ class PearlVerifyInput(SpecInput):
                     revised_offset = 0
             else:
                 for j in range(valid_len):
-                    if coins[i, j] <= target_prob[i, j]:
+                    probs_row = probs_view[i, j].clone()
+                    probs_row = _apply_sampling_filters(
+                        probs_row,
+                        int(sampling_info.top_ks[i].item()),
+                        float(sampling_info.top_ps[i].item()),
+                        float(sampling_info.min_ps[i].item()),
+                    )
+                    draft_token_id = draft_tokens[i, j].item()
+                    if coins[i, j] <= probs_row[draft_token_id]:
                         accept_count += 1
                     else:
                         reject_pos = j
@@ -295,8 +342,14 @@ class PearlVerifyInput(SpecInput):
                     tokens_for_kv = draft_tokens[i, :accept_count].tolist()
                     req.pre_verify = False
                 else:
-                    draft_token_id = draft_tokens[i, reject_pos].item()
                     probs_row = probs_view[i, reject_pos].clone()
+                    probs_row = _apply_sampling_filters(
+                        probs_row,
+                        int(sampling_info.top_ks[i].item()),
+                        float(sampling_info.top_ps[i].item()),
+                        float(sampling_info.min_ps[i].item()),
+                    )
+                    draft_token_id = draft_tokens[i, reject_pos].item()
                     probs_row[draft_token_id] = 0.0
                     norm = probs_row.sum()
                     if norm > 0:
@@ -407,7 +460,7 @@ class PearlVerifyInput(SpecInput):
                     len(tokens_to_append),
                     len(tokens_for_kv) if tokens_for_kv is not None else 0,
                     req.finished(),
-                    float(target_prob[i, 0].item()) if target_prob.numel() else 0.0,
+                    target_prob0,
                     tokens_to_append,
                     repr(decoded_tokens) if decoded_tokens is not None else None,
                 )
