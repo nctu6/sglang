@@ -1,7 +1,6 @@
 import copy
 import dataclasses
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -63,6 +62,9 @@ class PearlWorker:
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self._auto_steps_enabled = server_args.speculative_num_steps == -1
+        self._adaptive_steps: Optional[int] = None
+        self._accept_rate_ema: Optional[float] = None
         if target_worker.model_runner.device == "cuda":
             self.device = torch.device(f"cuda:{target_worker.model_runner.gpu_id}")
         else:
@@ -83,6 +85,16 @@ class PearlWorker:
             moe_ep_rank=moe_ep_rank,
             nccl_port=nccl_port,
         )
+        self._cuda_graph_draft_tokens = None
+        if (
+            server_args.speculative_num_steps == -1
+            and not server_args.disable_cuda_graph
+        ):
+            graph_runner = getattr(self.target_worker.model_runner, "graph_runner", None)
+            if graph_runner is not None:
+                self._cuda_graph_draft_tokens = graph_runner.num_tokens_per_bs
+            else:
+                self._cuda_graph_draft_tokens = server_args.speculative_num_draft_tokens
         self._auto_steps_buckets = None
         if self.speculative_num_steps == -1:
             self._auto_steps_buckets = self._auto_tune_steps()
@@ -115,26 +127,6 @@ class PearlWorker:
         dummy = _DummyBatch(reqs=reqs, device=self.device)
         return SamplingBatchInfo.from_schedule_batch(dummy, self.target_vocab_size)
 
-    def _parse_int_list_env(self, name: str, default: list[int]) -> list[int]:
-        raw = os.environ.get(name)
-        if not raw:
-            return default
-        values = []
-        for chunk in raw.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            try:
-                value = int(chunk)
-            except ValueError:
-                logger.warning("PEARL auto steps: invalid %s entry %r", name, chunk)
-                continue
-            if value <= 0:
-                logger.warning("PEARL auto steps: non-positive %s entry %r", name, chunk)
-                continue
-            values.append(value)
-        return values or default
-
     def _profile_model_speed(
         self, model_runner, batch_size: int, profile_steps: int, skip_steps: int
     ) -> float:
@@ -159,16 +151,10 @@ class PearlWorker:
 
     def _auto_tune_steps(self) -> list[tuple[int, int]]:
         default_buckets = [1, 2, 4, 8, 16, 32]
-        buckets = self._parse_int_list_env(
-            "SGLANG_PEARL_AUTO_STEPS_BS", default_buckets
-        )
-        buckets = sorted(set(buckets))
-        profile_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_PROFILE_STEPS", "12"))
-        skip_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_SKIP_STEPS", "2"))
-        auto_steps = (
-            (self.server_args.speculative_auto_steps or "").strip()
-            or os.environ.get("SGLANG_PEARL_AUTO_STEPS", "").strip()
-        )
+        buckets = default_buckets
+        profile_steps = 12
+        skip_steps = 2
+        auto_steps = (self.server_args.speculative_auto_steps or "").strip()
         max_steps = None
         steps_mult = None
         if auto_steps:
@@ -192,9 +178,9 @@ class PearlWorker:
                         "PEARL auto steps unknown key %r (use max, mult)" % key
                     )
         if max_steps is None:
-            max_steps = int(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MAX", "8"))
+            max_steps = 8
         if steps_mult is None:
-            steps_mult = float(os.environ.get("SGLANG_PEARL_AUTO_STEPS_MULT", "4.0"))
+            steps_mult = 4.0
         max_steps = max(1, max_steps)
         if steps_mult <= 0:
             raise ValueError("PEARL auto steps multiplier must be positive.")
@@ -260,6 +246,8 @@ class PearlWorker:
                 break
         if bucket_steps is None:
             bucket_steps = self._auto_steps_buckets[-1][1]
+        if self._adaptive_steps is not None:
+            bucket_steps = min(bucket_steps, self._adaptive_steps)
         if bucket_steps == self.speculative_num_steps:
             return
         self.speculative_num_steps = bucket_steps
@@ -273,6 +261,86 @@ class PearlWorker:
                 batch_size,
                 bucket_steps,
             )
+
+    def _update_adaptive_steps(self, accept_rate: float) -> None:
+        if not self._auto_steps_enabled or self.speculative_num_steps <= 1:
+            return
+        if self._accept_rate_ema is None:
+            self._accept_rate_ema = accept_rate
+        else:
+            self._accept_rate_ema = 0.8 * self._accept_rate_ema + 0.2 * accept_rate
+
+        ema = self._accept_rate_ema
+        if ema < 0.5:
+            scale = 0.4
+        elif ema < 0.7:
+            scale = 0.6
+        elif ema < 0.85:
+            scale = 0.8
+        else:
+            scale = 1.0
+        new_steps = max(1, int(round(self.speculative_num_steps * scale)))
+        if self._adaptive_steps != new_steps:
+            self._adaptive_steps = new_steps
+            if _PEARL_DEBUG:
+                logger.info(
+                    "PEARL adaptive steps: accept_rate=%.3f ema=%.3f steps=%s",
+                    accept_rate,
+                    ema,
+                    new_steps,
+                )
+
+    def _should_disable_cuda_graph(self) -> bool:
+        return False
+
+    def _get_graph_token_num(self) -> int:
+        if self.server_args.disable_cuda_graph:
+            return self.speculative_num_draft_tokens
+        graph_runner = getattr(self.target_worker.model_runner, "graph_runner", None)
+        if graph_runner is not None:
+            return int(graph_runner.num_tokens_per_bs)
+        if self._cuda_graph_draft_tokens is not None:
+            return self._cuda_graph_draft_tokens
+        return self.speculative_num_draft_tokens
+
+    def _pad_verify_tokens(
+        self, tokens: torch.Tensor | list[torch.Tensor], draft_token_num: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(tokens, list):
+            lengths = [min(int(t.numel()), draft_token_num) for t in tokens]
+            padded = []
+            for t in tokens:
+                t = t.to(self.device)
+                if t.numel() > draft_token_num:
+                    t = t[:draft_token_num]
+                if t.numel() < draft_token_num:
+                    pad = torch.zeros(
+                        (draft_token_num - t.numel(),),
+                        dtype=t.dtype,
+                        device=self.device,
+                    )
+                    t = torch.cat([t, pad], dim=0)
+                padded.append(t)
+            out = torch.stack(padded, dim=0)
+            valid_lens = torch.tensor(lengths, dtype=torch.int32, device=self.device)
+            return out, valid_lens
+
+        if tokens.ndim == 1:
+            tokens = tokens.unsqueeze(0)
+        cur = tokens.shape[1]
+        valid_lens = torch.full(
+            (tokens.shape[0],), cur, dtype=torch.int32, device=self.device
+        )
+        if cur == draft_token_num:
+            return tokens, valid_lens
+        if cur > draft_token_num:
+            return tokens[:, :draft_token_num], valid_lens.clamp(max=draft_token_num)
+        pad = torch.zeros(
+            (tokens.shape[0], draft_token_num - cur),
+            dtype=tokens.dtype,
+            device=tokens.device,
+        )
+        return torch.cat([tokens, pad], dim=1), valid_lens
 
     def clear_cache_pool(self):
         # Allocator is shared with target worker.
@@ -313,18 +381,21 @@ class PearlWorker:
             "PEARL tokenizer mismatch: use a draft model with the same tokenizer as the target."
         )
 
-    def _allocate_draft_slots(self, batch: ScheduleBatch):
+    def _allocate_draft_slots(
+        self, batch: ScheduleBatch, draft_token_num: Optional[int] = None
+    ):
+        draft_token_num = draft_token_num or self.speculative_num_draft_tokens
         if self.page_size == 1:
             out_cache_loc = alloc_token_slots(
                 batch.tree_cache,
-                batch.batch_size() * self.speculative_num_draft_tokens,
+                batch.batch_size() * draft_token_num,
             )
-            end_offset = batch.seq_lens + self.speculative_num_draft_tokens
+            end_offset = batch.seq_lens + draft_token_num
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
-            end_offset = prefix_lens + self.speculative_num_draft_tokens
-            end_offset_cpu = prefix_lens_cpu + self.speculative_num_draft_tokens
+            end_offset = prefix_lens + draft_token_num
+            end_offset_cpu = prefix_lens_cpu + draft_token_num
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
@@ -337,7 +408,7 @@ class PearlWorker:
                 end_offset,
                 end_offset_cpu,
                 last_loc,
-                batch.batch_size() * self.speculative_num_draft_tokens,
+                batch.batch_size() * draft_token_num,
             )
 
         bs = batch.batch_size()
@@ -352,30 +423,62 @@ class PearlWorker:
         )
         return out_cache_loc
 
-    def _build_positions(self, batch: ScheduleBatch) -> torch.Tensor:
+    def _build_positions(
+        self, batch: ScheduleBatch, draft_token_num: Optional[int] = None
+    ) -> torch.Tensor:
+        draft_token_num = draft_token_num or self.speculative_num_draft_tokens
         base = batch.seq_lens.to(self.device, non_blocking=True).unsqueeze(1)
         offsets = torch.arange(
-            self.speculative_num_draft_tokens, device=self.device
+            draft_token_num, device=self.device
         ).unsqueeze(0)
         positions = (base + offsets).reshape(-1)
         return positions
 
-    def _build_custom_mask(self, batch: ScheduleBatch) -> torch.Tensor:
+    def _build_custom_mask(
+        self,
+        batch: ScheduleBatch,
+        draft_token_num: Optional[int] = None,
+        valid_draft_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        draft_token_num = draft_token_num or self.speculative_num_draft_tokens
         masks = []
-        draft_mask = torch.tril(
+        base_draft_mask = torch.tril(
             torch.ones(
-                (self.speculative_num_draft_tokens, self.speculative_num_draft_tokens),
+                (draft_token_num, draft_token_num),
                 dtype=torch.bool,
                 device=self.device,
             )
         )
-        for seq_len in batch.seq_lens_cpu.tolist():
+        if valid_draft_lens is None:
+            valid_lens = [draft_token_num] * batch.batch_size()
+        elif isinstance(valid_draft_lens, torch.Tensor):
+            valid_lens = [int(x) for x in valid_draft_lens.tolist()]
+        else:
+            valid_lens = [int(x) for x in valid_draft_lens]
+
+        for idx, seq_len in enumerate(batch.seq_lens_cpu.tolist()):
             prefix_len = max(int(seq_len), 0)
             prefix_mask = torch.ones(
-                (self.speculative_num_draft_tokens, prefix_len),
+                (draft_token_num, prefix_len),
                 dtype=torch.bool,
                 device=self.device,
             )
+            valid_len = valid_lens[idx] if idx < len(valid_lens) else draft_token_num
+            if valid_len < draft_token_num:
+                if valid_len <= 0:
+                    prefix_mask.zero_()
+                    draft_mask = torch.zeros(
+                        (draft_token_num, draft_token_num),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                else:
+                    prefix_mask[valid_len:, :] = False
+                    draft_mask = base_draft_mask.clone()
+                    draft_mask[valid_len:, :] = False
+                    draft_mask[:, valid_len:] = False
+            else:
+                draft_mask = base_draft_mask
             masks.append(torch.cat([prefix_mask, draft_mask], dim=1).reshape(-1))
         if not masks:
             return torch.empty((0,), dtype=torch.bool, device=self.device)
@@ -497,10 +600,15 @@ class PearlWorker:
         self.token_to_kv_pool_allocator.free(out_cache_loc)
         return pre_indices, prefix_logits
 
-    def _slice_out_cache_loc(self, out_cache_loc: torch.Tensor, indices: list[int]):
+    def _slice_out_cache_loc(
+        self,
+        out_cache_loc: torch.Tensor,
+        indices: list[int],
+        draft_token_num: Optional[int] = None,
+    ):
         if out_cache_loc is None or not indices:
             return None
-        stride = self.speculative_num_draft_tokens
+        stride = draft_token_num or self.speculative_num_draft_tokens
         segments = []
         for idx in indices:
             start = idx * stride
@@ -546,6 +654,9 @@ class PearlWorker:
         prefix_logits: Optional[torch.Tensor] = None,
         prefix_logits_mask: Optional[torch.Tensor] = None,
         next_window_tokens: Optional[torch.Tensor] = None,
+        disable_cuda_graph: bool = False,
+        draft_token_num: Optional[int] = None,
+        valid_draft_lens: Optional[torch.Tensor] = None,
     ):
         if not indices:
             return None
@@ -554,6 +665,7 @@ class PearlWorker:
         sampling_info = self._build_sampling_info(sub_reqs)
         sub_batch = dataclasses.replace(batch)
         sub_batch.reqs = sub_reqs
+        sub_batch.disable_cuda_graph = disable_cuda_graph
         sub_batch.req_pool_indices = batch.req_pool_indices[indices]
         sub_batch.seq_lens = batch.seq_lens[indices]
         sub_batch.seq_lens_cpu = batch.seq_lens_cpu[indices]
@@ -578,17 +690,21 @@ class PearlWorker:
         sub_batch.input_ids = verify_tokens.reshape(-1)
         sub_batch.out_cache_loc = out_cache_loc
 
-        positions = self._build_positions(sub_batch)
-        custom_mask = self._build_custom_mask(sub_batch)
+        token_num = draft_token_num or self.speculative_num_draft_tokens
+        positions = self._build_positions(sub_batch, token_num)
+        custom_mask = self._build_custom_mask(
+            sub_batch, token_num, valid_draft_lens=valid_draft_lens
+        )
         spec_info = PearlVerifyInput(
             sub_batch.input_ids,
             custom_mask,
             positions,
-            self.speculative_num_draft_tokens,
+            token_num,
             self.target_vocab_size,
             next_window_tokens=next_window_tokens,
             prefix_logits=prefix_logits,
             prefix_logits_mask=prefix_logits_mask,
+            valid_draft_lens=valid_draft_lens,
         )
         sub_batch.spec_info = spec_info
 
@@ -628,7 +744,8 @@ class PearlWorker:
             torch.cuda.set_device(self.target_gpu_id)
 
         batch.spec_info = None
-        out_cache_loc = self._allocate_draft_slots(batch)
+        graph_token_num = self._get_graph_token_num()
+        out_cache_loc = self._allocate_draft_slots(batch, graph_token_num)
         draft_future = self._draft_executor.submit(self.draft_worker.run_draft, batch)
 
         post_indices = []
@@ -676,6 +793,7 @@ class PearlWorker:
         can_run_cuda_graph = False
 
         if allow_split:
+            disable_cuda_graph = self._should_disable_cuda_graph()
             verify_tokens = []
             for idx in post_indices:
                 prev_window = batch.reqs[idx].pearl_prev_window
@@ -686,8 +804,12 @@ class PearlWorker:
                         batch.reqs[idx].rid,
                         prev_window.numel(),
                     )
-            verify_tokens = torch.stack(verify_tokens, dim=0)
-            post_out_cache_loc = self._slice_out_cache_loc(out_cache_loc, post_indices)
+            verify_tokens, valid_lens = self._pad_verify_tokens(
+                verify_tokens, graph_token_num
+            )
+            post_out_cache_loc = self._slice_out_cache_loc(
+                out_cache_loc, post_indices, graph_token_num
+            )
             post_result = self._verify_subset(
                 batch,
                 post_indices,
@@ -701,6 +823,9 @@ class PearlWorker:
                     if prefix_logits_mask is not None
                     else None
                 ),
+                disable_cuda_graph=disable_cuda_graph,
+                draft_token_num=graph_token_num,
+                valid_draft_lens=valid_lens,
             )
             if post_result is not None:
                 logits_output = post_result["logits_output"]
@@ -732,7 +857,12 @@ class PearlWorker:
                         batch.reqs[idx].rid,
                         pre_verify_tokens[local_idx].numel(),
                     )
-            pre_out_cache_loc = self._slice_out_cache_loc(out_cache_loc, pre_indices)
+            pre_verify_tokens, valid_lens = self._pad_verify_tokens(
+                pre_verify_tokens, graph_token_num
+            )
+            pre_out_cache_loc = self._slice_out_cache_loc(
+                out_cache_loc, pre_indices, graph_token_num
+            )
             pre_result = self._verify_subset(
                 batch,
                 pre_indices,
@@ -747,6 +877,9 @@ class PearlWorker:
                     else None
                 ),
                 next_window_tokens=draft_tokens[pre_indices],
+                disable_cuda_graph=disable_cuda_graph,
+                draft_token_num=graph_token_num,
+                valid_draft_lens=valid_lens,
             )
             if pre_result is not None:
                 logits_output = pre_result["logits_output"]
@@ -779,7 +912,9 @@ class PearlWorker:
                             req.rid,
                             prev_window.numel(),
                         )
-                verify_tokens = torch.stack(verify_tokens, dim=0)
+                verify_tokens, valid_lens = self._pad_verify_tokens(
+                    verify_tokens, graph_token_num
+                )
             else:
                 draft_tokens = draft_future.result()
                 if self.target_vocab_size:
@@ -810,19 +945,25 @@ class PearlWorker:
                                 "pre" if getattr(req, "pre_verify", True) else "post",
                                 draft_tokens[i].numel(),
                             )
-                verify_tokens = torch.stack(verify_tokens, dim=0)
+                verify_tokens, valid_lens = self._pad_verify_tokens(
+                    verify_tokens, graph_token_num
+                )
 
             batch.out_cache_loc = out_cache_loc
             batch.input_ids = verify_tokens.reshape(-1)
+            batch.disable_cuda_graph = self._should_disable_cuda_graph()
             spec_info = PearlVerifyInput(
                 batch.input_ids,
-                self._build_custom_mask(batch),
-                self._build_positions(batch),
-                self.speculative_num_draft_tokens,
+                self._build_custom_mask(
+                    batch, graph_token_num, valid_draft_lens=valid_lens
+                ),
+                self._build_positions(batch, graph_token_num),
+                graph_token_num,
                 self.target_vocab_size,
                 next_window_tokens=draft_tokens if not post_verify_only else None,
                 prefix_logits=prefix_logits,
                 prefix_logits_mask=prefix_logits_mask,
+                valid_draft_lens=valid_lens,
             )
             batch.spec_info = spec_info
 
@@ -878,19 +1019,24 @@ class PearlWorker:
 
         spec_info_full = PearlVerifyInput(
             torch.zeros(
-                (batch.batch_size() * self.speculative_num_draft_tokens,),
+                (batch.batch_size() * graph_token_num,),
                 dtype=torch.int64,
                 device=self.device,
             ),
-            self._build_custom_mask(batch),
-            self._build_positions(batch),
-            self.speculative_num_draft_tokens,
+            self._build_custom_mask(batch, graph_token_num),
+            self._build_positions(batch, graph_token_num),
+            graph_token_num,
             self.target_vocab_size,
         )
         spec_info_full.accept_length = torch.tensor(
             accept_length_list_full, dtype=torch.int32, device=self.device
         )
         batch.spec_info = spec_info_full
+        if accept_length_list_full:
+            accept_rate = sum(accept_length_list_full) / (
+                len(accept_length_list_full) * max(self.speculative_num_steps, 1)
+            )
+            self._update_adaptive_steps(accept_rate)
 
         self._recompute_revised_kv(batch, spec_info_full)
         self.draft_worker.update_after_verify(batch.reqs)

@@ -23,6 +23,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.utils import next_power_of_2
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -42,6 +43,7 @@ class PearlVerifyInput(SpecInput):
         next_window_tokens: Optional[torch.Tensor] = None,
         prefix_logits: Optional[torch.Tensor] = None,
         prefix_logits_mask: Optional[torch.Tensor] = None,
+        valid_draft_lens: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.PEARL_VERIFY)
         self.draft_token = draft_token
@@ -53,6 +55,12 @@ class PearlVerifyInput(SpecInput):
         self.next_window_tokens = next_window_tokens
         self.prefix_logits = prefix_logits
         self.prefix_logits_mask = prefix_logits_mask
+        self.valid_draft_lens = (
+            valid_draft_lens.to("cpu") if valid_draft_lens is not None else None
+        )
+        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.num_tokens_per_batch = draft_token_num
+        self.num_tokens_for_logprob_per_batch = draft_token_num
         self.accepted_indices: Optional[torch.Tensor] = None
         self.accept_length: Optional[torch.Tensor] = None
         self.verified_id: Optional[torch.Tensor] = None
@@ -213,6 +221,11 @@ class PearlVerifyInput(SpecInput):
         has_finished = False
 
         coins = torch.rand_like(target_prob)
+        valid_lens = (
+            self.valid_draft_lens.tolist()
+            if self.valid_draft_lens is not None
+            else [self.draft_token_num] * bs
+        )
 
         for i, req in enumerate(batch.reqs):
             accept_count = 0
@@ -220,14 +233,20 @@ class PearlVerifyInput(SpecInput):
             pre_verify = getattr(req, "pre_verify", True)
             pre_verify_before = pre_verify
             next_window = None
+            valid_len = valid_lens[i] if i < len(valid_lens) else self.draft_token_num
             if self.next_window_tokens is not None:
-                next_window = self.next_window_tokens[i].tolist()
+                next_window = self.next_window_tokens[i][:valid_len].tolist()
             tokens_for_kv = None
             used_revised_token = False
             revised_offset = None
             req.pearl_revised_token = None
 
-            if pre_verify:
+            if valid_len <= 0:
+                tokens_to_append = []
+                tokens_for_kv = []
+                accept_count = 0
+                req.pre_verify = True
+            elif pre_verify:
                 if coins[i, 0] <= target_prob[i, 0]:
                     tokens_to_append = [draft_tokens[i, 0].item()]
                     tokens_for_kv = tokens_to_append
@@ -264,7 +283,7 @@ class PearlVerifyInput(SpecInput):
                     used_revised_token = True
                     revised_offset = 0
             else:
-                for j in range(self.draft_token_num):
+                for j in range(valid_len):
                     if coins[i, j] <= target_prob[i, j]:
                         accept_count += 1
                     else:

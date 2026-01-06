@@ -443,6 +443,7 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
+    pearl_vectorize_draft: bool = True
 
     # Expert parallelism
     ep_size: int = 1
@@ -1983,12 +1984,11 @@ class ServerArgs:
                 self.disable_overlap_schedule = True
 
             if self.speculative_algorithm == "PEARL":
-                if not envs.SGLANG_PEARL_ENABLE_CUDA_GRAPH.get():
-                    if not self.disable_cuda_graph:
-                        self.disable_cuda_graph = True
-                        logger.warning(
-                            "CUDA graphs are disabled for PEARL speculative decoding."
-                        )
+                self.pearl_vectorize_draft = bool(self.pearl_vectorize_draft)
+                if self.disable_cuda_graph:
+                    logger.warning(
+                        "CUDA graphs are disabled for PEARL speculative decoding."
+                    )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
@@ -2043,19 +2043,32 @@ class ServerArgs:
                     logger.warning(
                         "speculative_num_steps is not set for PEARL; defaulting to 4."
                     )
-                if (
-                    self.speculative_num_steps == -1
-                    and envs.SGLANG_PEARL_ENABLE_CUDA_GRAPH.get()
-                ):
-                    # CUDA graph capture needs a fixed token count.
-                    self.speculative_num_steps = 2
-                    logger.warning(
-                        "PEARL auto-tune (-1) is disabled when CUDA graphs are enabled; "
-                        "using speculative_num_steps=2."
-                    )
                 if self.speculative_num_steps == -1:
                     if self.speculative_num_draft_tokens is None:
                         self.speculative_num_draft_tokens = -1
+                    if not self.disable_cuda_graph:
+                        auto_steps = (self.speculative_auto_steps or "").strip()
+                        max_steps = 8
+                        if auto_steps:
+                            for chunk in auto_steps.split(","):
+                                chunk = chunk.strip()
+                                if not chunk:
+                                    continue
+                                if "=" not in chunk:
+                                    continue
+                                key, value = chunk.split("=", 1)
+                                if key.strip().lower() == "max":
+                                    try:
+                                        max_steps = int(value.strip())
+                                    except ValueError:
+                                        pass
+                        max_steps = max(1, max_steps)
+                        # Use a positive draft token count for cuda graph capture.
+                        self.speculative_num_draft_tokens = max_steps
+                    if self.speculative_num_draft_tokens is not None:
+                        self.speculative_num_draft_tokens = max(
+                            1, int(self.speculative_num_draft_tokens)
+                        )
                 else:
                     if (
                         self.speculative_num_draft_tokens is not None
@@ -3425,8 +3438,7 @@ class ServerArgs:
             "--speculative-auto-steps",
             type=str,
             help=(
-                "PEARL auto-tune settings in key=value pairs, e.g. 'max=8,mult=4.0'. "
-                "Overrides SGLANG_PEARL_AUTO_STEPS."
+                "PEARL auto-tune settings in key=value pairs, e.g. 'max=8,mult=4.0'."
             ),
             default=ServerArgs.speculative_auto_steps,
         )
@@ -3551,6 +3563,12 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+        parser.add_argument(
+            "--pearl-vectorize-draft",
+            type=int,
+            default=int(ServerArgs.pearl_vectorize_draft),
+            help="Enable vectorized draft token generation for PEARL (1=on, 0=off).",
         )
 
         # Expert parallelism
