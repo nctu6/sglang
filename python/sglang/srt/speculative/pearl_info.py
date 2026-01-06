@@ -158,12 +158,16 @@ class PearlVerifyInput(SpecInput):
         prev_logits_list = []
         for i, req in enumerate(batch.reqs):
             prev_logits = getattr(req, "pearl_prev_logits", None)
+            prev_window = getattr(req, "pearl_prev_window", None)
+            prev_window_logits = getattr(req, "pearl_prev_window_logits", None)
             if (
                 self.prefix_logits is not None
                 and self.prefix_logits_mask is not None
                 and self.prefix_logits_mask[i]
             ):
                 prev_logits_list.append(self.prefix_logits[i])
+            elif prev_window is not None and prev_window_logits is not None:
+                prev_logits_list.append(prev_window_logits.to(raw_logits.device))
             elif prev_logits is None or prev_logits.shape[-1] != raw_logits.shape[-1]:
                 prev_logits_list.append(raw_logits[i, 0])
             else:
@@ -434,8 +438,10 @@ class PearlVerifyInput(SpecInput):
                 req.pearl_prev_window = torch.tensor(
                     next_window, dtype=torch.int64, device=self.device
                 )
+                req.pearl_prev_window_logits = aligned_logits[i, 0].detach()
             else:
                 req.pearl_prev_window = None
+                req.pearl_prev_window_logits = None
 
             if verified_count > 0 and not used_revised_token:
                 req.pearl_prev_logits = raw_logits[i, verified_count - 1].detach()

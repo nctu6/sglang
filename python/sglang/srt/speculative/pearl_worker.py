@@ -262,13 +262,15 @@ class PearlWorker:
                 bucket_steps,
             )
 
-    def _update_adaptive_steps(self, accept_rate: float) -> None:
+    def _update_adaptive_steps(self, extra_accept_rate: float) -> None:
         if not self._auto_steps_enabled or self.speculative_num_steps <= 1:
             return
         if self._accept_rate_ema is None:
-            self._accept_rate_ema = accept_rate
+            self._accept_rate_ema = extra_accept_rate
         else:
-            self._accept_rate_ema = 0.8 * self._accept_rate_ema + 0.2 * accept_rate
+            self._accept_rate_ema = (
+                0.8 * self._accept_rate_ema + 0.2 * extra_accept_rate
+            )
 
         ema = self._accept_rate_ema
         if ema < 0.5:
@@ -284,8 +286,8 @@ class PearlWorker:
             self._adaptive_steps = new_steps
             if _PEARL_DEBUG:
                 logger.info(
-                    "PEARL adaptive steps: accept_rate=%.3f ema=%.3f steps=%s",
-                    accept_rate,
+                    "PEARL adaptive steps: extra_accept_rate=%.3f ema=%.3f steps=%s",
+                    extra_accept_rate,
                     ema,
                     new_steps,
                 )
@@ -799,6 +801,8 @@ class PearlWorker:
             verify_tokens = []
             for idx in post_indices:
                 prev_window = batch.reqs[idx].pearl_prev_window
+                if prev_window is not None and prev_window.numel() > self.speculative_num_steps:
+                    prev_window = prev_window[: self.speculative_num_steps]
                 verify_tokens.append(prev_window.to(self.device))
                 if _PEARL_DEBUG:
                     logger.info(
@@ -908,6 +912,8 @@ class PearlWorker:
             if post_verify_only:
                 for req in batch.reqs:
                     prev_window = req.pearl_prev_window
+                    if prev_window is not None and prev_window.numel() > self.speculative_num_steps:
+                        prev_window = prev_window[: self.speculative_num_steps]
                     verify_tokens.append(prev_window.to(self.device))
                     if _PEARL_DEBUG:
                         logger.info(
@@ -933,6 +939,8 @@ class PearlWorker:
                 for i, req in enumerate(batch.reqs):
                     prev_window = getattr(req, "pearl_prev_window", None)
                     if not getattr(req, "pre_verify", True) and prev_window is not None:
+                        if prev_window.numel() > self.speculative_num_steps:
+                            prev_window = prev_window[: self.speculative_num_steps]
                         verify_tokens.append(prev_window.to(self.device))
                         if _PEARL_DEBUG:
                             logger.info(
@@ -1038,19 +1046,29 @@ class PearlWorker:
         )
         batch.spec_info = spec_info_full
         if accept_length_list_full:
-            accept_rate = sum(accept_length_list_full) / (
-                len(accept_length_list_full) * max(self.speculative_num_steps, 1)
+            steps = max(self.speculative_num_steps, 1)
+            extra_accept_max = max(steps - 1, 1)
+            extra_accept_rate = sum(accept_length_list_full) / (
+                len(accept_length_list_full) * extra_accept_max
             )
-            self._update_adaptive_steps(accept_rate)
+            accept_count_sum = sum(
+                int(getattr(req, "pearl_accept_count", 0)) for req in batch.reqs
+            )
+            total_accept_rate = accept_count_sum / (len(accept_length_list_full) * steps)
+            self._update_adaptive_steps(extra_accept_rate)
             avg_accept = sum(accept_length_list_full) / len(accept_length_list_full)
+            avg_accept_count = accept_count_sum / len(accept_length_list_full)
             logger.info(
-                "PEARL batch stats: bs=%d pre=%d post=%d steps=%d accept_rate=%.3f avg_accept=%.2f draft_ms=%.2f",
+                "PEARL batch stats: bs=%d pre=%d post=%d steps=%d accept_rate=%.3f "
+                "extra_accept_rate=%.3f avg_accept=%.2f avg_accept_count=%.2f draft_ms=%.2f",
                 batch.batch_size(),
                 len(pre_indices),
                 len(post_indices),
-                self.speculative_num_steps,
-                accept_rate,
+                steps,
+                total_accept_rate,
+                extra_accept_rate,
                 avg_accept,
+                avg_accept_count,
                 (draft_elapsed or 0.0) * 1000.0,
             )
 
