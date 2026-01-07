@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
+from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
@@ -40,7 +41,9 @@ class PearlVerifyInput(SpecInput):
         positions: torch.Tensor,
         draft_token_num: int,
         vocab_size: int,
+        draft_probs: Optional[torch.Tensor] = None,
         next_window_tokens: Optional[torch.Tensor] = None,
+        next_window_probs: Optional[torch.Tensor] = None,
         prefix_logits: Optional[torch.Tensor] = None,
         prefix_logits_mask: Optional[torch.Tensor] = None,
         valid_draft_lens: Optional[torch.Tensor] = None,
@@ -52,7 +55,13 @@ class PearlVerifyInput(SpecInput):
         self.draft_token_num = draft_token_num
         self.vocab_size = vocab_size
         self.device = draft_token.device
+        if draft_probs is not None and draft_probs.device != self.device:
+            draft_probs = draft_probs.to(self.device, non_blocking=True)
+        self.draft_probs = draft_probs
         self.next_window_tokens = next_window_tokens
+        if next_window_probs is not None and next_window_probs.device != self.device:
+            next_window_probs = next_window_probs.to(self.device, non_blocking=True)
+        self.next_window_probs = next_window_probs
         self.prefix_logits = prefix_logits
         self.prefix_logits_mask = prefix_logits_mask
         self.valid_draft_lens = (
@@ -216,11 +225,35 @@ class PearlVerifyInput(SpecInput):
         scaled_logits = aligned_logits.reshape(bs * self.draft_token_num, -1) / temperatures
         probs = torch.softmax(scaled_logits, dim=-1)
         probs_view = probs.view(bs, self.draft_token_num, -1)
+        draft_probs_view = None
+        if self.draft_probs is not None:
+            draft_probs_view = self.draft_probs
+            if draft_probs_view.dim() == 1:
+                draft_probs_view = draft_probs_view.view(bs, -1)
+            if draft_probs_view.shape[0] != bs:
+                draft_probs_view = None
+            else:
+                if draft_probs_view.shape[1] > self.draft_token_num:
+                    draft_probs_view = draft_probs_view[:, : self.draft_token_num]
+                elif draft_probs_view.shape[1] < self.draft_token_num:
+                    pad = torch.zeros(
+                        (bs, self.draft_token_num - draft_probs_view.shape[1]),
+                        dtype=draft_probs_view.dtype,
+                        device=draft_probs_view.device,
+                    )
+                    draft_probs_view = torch.cat([draft_probs_view, pad], dim=1)
+                draft_probs_view = draft_probs_view.float()
 
         accepted_indices = []
         verified_tokens = []
         accept_length_list = []
         has_finished = False
+        pre_count = 0
+        pre_accept = 0
+        pre_target_prob_sum = 0.0
+        pre_draft_prob_sum = 0.0
+        pre_accept_prob_sum = 0.0
+        pre_filtered_zero = 0
 
         coins = torch.rand(
             (bs, self.draft_token_num), dtype=probs.dtype, device=self.device
@@ -243,8 +276,11 @@ class PearlVerifyInput(SpecInput):
             tokens_for_kv = None
             used_revised_token = False
             revised_offset = None
+            consumed_full_window = False
             req.pearl_revised_token = None
             target_prob0 = 0.0
+            draft_prob0 = None
+            accept_prob0 = None
 
             def _apply_sampling_filters(
                 probs_row: torch.Tensor,
@@ -277,65 +313,103 @@ class PearlVerifyInput(SpecInput):
                     filtered = filtered / norm
                 return filtered
 
+            def _sample_from_filtered_probs(
+                probs_row: torch.Tensor,
+                position: int,
+            ) -> int:
+                if float(probs_row.sum().item()) <= 0.0:
+                    probs_row = torch.full_like(
+                        probs_row, 1.0 / max(probs_row.numel(), 1)
+                    )
+                probs_row = probs_row.unsqueeze(0)
+                if sampling_info.sampling_seed is not None:
+                    sampled = multinomial_with_seed(
+                        probs_row,
+                        sampling_info.sampling_seed[i : i + 1],
+                        torch.tensor([position], device=probs_row.device),
+                    )
+                    return int(sampled.item())
+                sampled = torch.multinomial(probs_row, num_samples=1)
+                return int(sampled.item())
+
+            def _accept_prob(target_prob: float, draft_prob: Optional[float]) -> float:
+                if draft_prob is None or not math.isfinite(draft_prob) or draft_prob <= 0.0:
+                    return target_prob
+                ratio = target_prob / max(draft_prob, 1e-8)
+                return 1.0 if ratio >= 1.0 else ratio
+
             if valid_len <= 0:
                 tokens_to_append = []
                 tokens_for_kv = []
                 accept_count = 0
                 req.pre_verify = True
             elif pre_verify:
-                probs_row = probs_view[i, 0].clone()
-                probs_row = _apply_sampling_filters(
-                    probs_row,
-                    int(sampling_info.top_ks[i].item()),
-                    float(sampling_info.top_ps[i].item()),
-                    float(sampling_info.min_ps[i].item()),
-                )
+                pre_count += 1
                 draft_token_id = draft_tokens[i, 0].item()
-                target_prob0 = float(probs_row[draft_token_id].item())
-                if coins[i, 0] <= target_prob0:
-                    tokens_to_append = [draft_tokens[i, 0].item()]
-                    tokens_for_kv = tokens_to_append
-                    accept_count = 1
-                    req.pre_verify = False
-                else:
-                    probs_row[draft_token_id] = 0.0
-                    norm = probs_row.sum()
-                    if norm > 0:
-                        probs_row = probs_row / norm
-                    probs_row = probs_row.unsqueeze(0)
-                    position = int(batch.seq_lens[i].item())
-                    positions = torch.tensor([position], device=probs_row.device)
-                    sampling_seed = (
-                        sampling_info.sampling_seed[i : i + 1]
-                        if sampling_info.sampling_seed is not None
-                        else None
+                target_prob0 = float(probs_view[i, 0][draft_token_id].item())
+                if draft_probs_view is not None:
+                    draft_prob0 = float(draft_probs_view[i, 0].item())
+                accept_prob0 = _accept_prob(target_prob0, draft_prob0)
+                pre_target_prob_sum += target_prob0
+                if draft_prob0 is not None:
+                    pre_draft_prob_sum += draft_prob0
+                if accept_prob0 is not None:
+                    pre_accept_prob_sum += accept_prob0
+                if (
+                    float(sampling_info.top_ks[i].item()) > 0
+                    or float(sampling_info.top_ps[i].item()) < 1.0
+                    or float(sampling_info.min_ps[i].item()) > 0.0
+                ):
+                    filtered_row = _apply_sampling_filters(
+                        probs_view[i, 0].clone(),
+                        int(sampling_info.top_ks[i].item()),
+                        float(sampling_info.top_ps[i].item()),
+                        float(sampling_info.min_ps[i].item()),
                     )
-                    revised_token = top_k_top_p_min_p_sampling_from_probs_torch(
-                        probs_row,
-                        sampling_info.top_ks[i : i + 1],
-                        sampling_info.top_ps[i : i + 1],
-                        sampling_info.min_ps[i : i + 1],
-                        sampling_info.need_min_p_sampling,
-                        sampling_seed,
-                        positions,
-                    )[0].item()
-                    tokens_to_append = [revised_token]
-                    tokens_for_kv = [revised_token]
+                    if float(filtered_row[draft_token_id].item()) <= 0.0:
+                        pre_filtered_zero += 1
+                if coins[i, 0] <= accept_prob0:
                     accept_count = 1
-                    req.pre_verify = True
-                    used_revised_token = True
-                    revised_offset = 0
-            else:
-                for j in range(valid_len):
-                    probs_row = probs_view[i, j].clone()
+                    reject_pos = None
+                    tokens_to_append = [draft_token_id]
+                    tokens_for_kv = tokens_to_append
+                    req.pre_verify = False
+                    consumed_full_window = valid_len <= 1
+                else:
+                    probs_row = probs_view[i, 0].clone()
                     probs_row = _apply_sampling_filters(
                         probs_row,
                         int(sampling_info.top_ks[i].item()),
                         float(sampling_info.top_ps[i].item()),
                         float(sampling_info.min_ps[i].item()),
                     )
+                    probs_row[draft_token_id] = 0.0
+                    norm = probs_row.sum()
+                    if norm > 0:
+                        probs_row = probs_row / norm
+                    position = int(batch.seq_lens[i].item())
+                    revised_token = _sample_from_filtered_probs(
+                        probs_row, position
+                    )
+                    tokens_to_append = [revised_token]
+                    tokens_for_kv = [revised_token]
+                    accept_count = 1
+                    reject_pos = 0
+                    req.pre_verify = True
+                    used_revised_token = True
+                    revised_offset = 0
+                if not req.pre_verify:
+                    pre_accept += 1
+            else:
+                for j in range(valid_len):
                     draft_token_id = draft_tokens[i, j].item()
-                    if coins[i, j] <= probs_row[draft_token_id]:
+                    draft_prob = None
+                    if draft_probs_view is not None:
+                        draft_prob = float(draft_probs_view[i, j].item())
+                    accept_prob = _accept_prob(
+                        float(probs_view[i, j][draft_token_id].item()), draft_prob
+                    )
+                    if coins[i, j] <= accept_prob:
                         accept_count += 1
                     else:
                         reject_pos = j
@@ -358,23 +432,10 @@ class PearlVerifyInput(SpecInput):
                     norm = probs_row.sum()
                     if norm > 0:
                         probs_row = probs_row / norm
-                    probs_row = probs_row.unsqueeze(0)
                     position = int(batch.seq_lens[i].item()) + reject_pos
-                    positions = torch.tensor([position], device=probs_row.device)
-                    sampling_seed = (
-                        sampling_info.sampling_seed[i : i + 1]
-                        if sampling_info.sampling_seed is not None
-                        else None
+                    revised_token = _sample_from_filtered_probs(
+                        probs_row, position
                     )
-                    revised_token = top_k_top_p_min_p_sampling_from_probs_torch(
-                        probs_row,
-                        sampling_info.top_ks[i : i + 1],
-                        sampling_info.top_ps[i : i + 1],
-                        sampling_info.min_ps[i : i + 1],
-                        sampling_info.need_min_p_sampling,
-                        sampling_seed,
-                        positions,
-                    )[0].item()
                     tokens_to_append = draft_tokens[i, :reject_pos].tolist() + [
                         revised_token
                     ]
@@ -434,14 +495,63 @@ class PearlVerifyInput(SpecInput):
                     verified_count = min(verified_count, offset + 1)
                     break
 
-            if not req.pre_verify and next_window is not None:
-                req.pearl_prev_window = torch.tensor(
-                    next_window, dtype=torch.int64, device=self.device
+            if not req.pre_verify and next_window is not None and not consumed_full_window:
+                next_probs = None
+                if self.next_window_probs is not None:
+                    window_probs = self.next_window_probs[i]
+                    if isinstance(window_probs, torch.Tensor):
+                        window_probs = window_probs[:valid_len].tolist()
+                    else:
+                        window_probs = list(window_probs)[:valid_len]
+                    next_probs = window_probs
+                next_tokens = (
+                    next_window[:valid_len].tolist()
+                    if isinstance(next_window, torch.Tensor)
+                    else list(next_window)[:valid_len]
                 )
-                req.pearl_prev_window_logits = aligned_logits[i, 0].detach()
+                if pre_verify_before:
+                    if len(next_tokens) > 1:
+                        req.pearl_prev_window = torch.tensor(
+                            next_tokens[1:], dtype=torch.int64, device=self.device
+                        )
+                        req.pearl_prev_window_logits = aligned_logits[i, 1].detach()
+                        if next_probs is not None and len(next_probs) > 1:
+                            req.pearl_prev_window_probs = torch.tensor(
+                                next_probs[1:],
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                        else:
+                            req.pearl_prev_window_probs = None
+                    else:
+                        req.pearl_prev_window = None
+                        req.pearl_prev_window_logits = None
+                        req.pearl_prev_window_probs = None
+                else:
+                    if next_tokens:
+                        req.pearl_prev_window = torch.tensor(
+                            next_tokens, dtype=torch.int64, device=self.device
+                        )
+                        if verified_count > 0:
+                            req.pearl_prev_window_logits = raw_logits[
+                                i, verified_count - 1
+                            ].detach()
+                        else:
+                            req.pearl_prev_window_logits = None
+                        if next_probs is not None and len(next_probs) == len(next_tokens):
+                            req.pearl_prev_window_probs = torch.tensor(
+                                next_probs, dtype=torch.float32, device=self.device
+                            )
+                        else:
+                            req.pearl_prev_window_probs = None
+                    else:
+                        req.pearl_prev_window = None
+                        req.pearl_prev_window_logits = None
+                        req.pearl_prev_window_probs = None
             else:
                 req.pearl_prev_window = None
                 req.pearl_prev_window_logits = None
+                req.pearl_prev_window_probs = None
 
             if verified_count > 0 and not used_revised_token:
                 req.pearl_prev_logits = raw_logits[i, verified_count - 1].detach()
@@ -470,6 +580,13 @@ class PearlVerifyInput(SpecInput):
                     tokens_to_append,
                     repr(decoded_tokens) if decoded_tokens is not None else None,
                 )
+
+        self.pre_verify_count = pre_count
+        self.pre_verify_accept = pre_accept
+        self.pre_target_prob_sum = pre_target_prob_sum
+        self.pre_draft_prob_sum = pre_draft_prob_sum
+        self.pre_accept_prob_sum = pre_accept_prob_sum
+        self.pre_filtered_zero = pre_filtered_zero
 
         if has_finished:
             pass

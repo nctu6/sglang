@@ -102,6 +102,7 @@ class PearlDraftWorker:
         self._cache_indices: Dict[str, torch.Tensor] = {}
         self._req_pool_map: Dict[int, int] = {}
         self._draft_buffers: Dict[str, list[int]] = {}
+        self._draft_prob_buffers: Dict[str, list[float]] = {}
         self._lock = threading.Lock()
         self._vectorize_draft = server_args.pearl_vectorize_draft
 
@@ -119,6 +120,9 @@ class PearlDraftWorker:
         for rid, buffer in self._draft_buffers.items():
             if len(buffer) > num_tokens:
                 self._draft_buffers[rid] = buffer[:num_tokens]
+        for rid, buffer in self._draft_prob_buffers.items():
+            if len(buffer) > num_tokens:
+                self._draft_prob_buffers[rid] = buffer[:num_tokens]
 
     def release_req(self, req):
         with self._lock:
@@ -133,6 +137,7 @@ class PearlDraftWorker:
                 self.token_to_kv_pool_allocator.free(indices)
             self._cache_lens.pop(rid, None)
             self._draft_buffers.pop(rid, None)
+            self._draft_prob_buffers.pop(rid, None)
 
     def _build_sampling_info(self, reqs):
         class _DummyBatch:
@@ -495,16 +500,20 @@ class PearlDraftWorker:
             for req in reqs:
                 rid = req.rid
                 buffer = self._draft_buffers.get(rid, [])
+                prob_buffer = self._draft_prob_buffers.get(rid, [])
                 accept_count = getattr(req, "pearl_accept_count", 0)
                 reject_pos = getattr(req, "pearl_reject_pos", None)
                 used_revised = getattr(req, "pearl_used_revised", False)
 
                 if used_revised or reject_pos is not None:
                     buffer = []
+                    prob_buffer = []
                 elif accept_count > 0:
                     buffer = buffer[accept_count:]
+                    prob_buffer = prob_buffer[accept_count:]
 
                 self._draft_buffers[rid] = buffer
+                self._draft_prob_buffers[rid] = prob_buffer
 
                 target_len = len(req.origin_input_ids) + len(req.output_ids)
                 desired_len = target_len + len(buffer)
@@ -531,10 +540,18 @@ class PearlDraftWorker:
         bs = batch.batch_size()
         max_draft_tokens = self.speculative_num_draft_tokens
         buffers = [list(self._draft_buffers.get(req.rid, [])) for req in batch.reqs]
+        prob_buffers = [
+            list(self._draft_prob_buffers.get(req.rid, [])) for req in batch.reqs
+        ]
         draft_tokens_tensor = torch.full(
             (bs, max_draft_tokens),
             -1,
             dtype=torch.int64,
+            device=self.device,
+        )
+        draft_probs_tensor = torch.zeros(
+            (bs, max_draft_tokens),
+            dtype=torch.float32,
             device=self.device,
         )
         filled = torch.zeros((bs,), dtype=torch.int64, device=self.device)
@@ -543,11 +560,16 @@ class PearlDraftWorker:
 
         for i, req in enumerate(batch.reqs):
             buffer = buffers[i]
+            prob_buffer = prob_buffers[i]
             buf_len = min(len(buffer), max_draft_tokens)
             if buf_len:
                 draft_tokens_tensor[i, :buf_len] = torch.tensor(
                     buffer[:buf_len], dtype=torch.int64, device=self.device
                 )
+                if prob_buffer:
+                    draft_probs_tensor[i, :buf_len] = torch.tensor(
+                        prob_buffer[:buf_len], dtype=torch.float32, device=self.device
+                    )
                 filled[i] = buf_len
                 current_tokens[i] = buffer[buf_len - 1]
             else:
@@ -557,6 +579,7 @@ class PearlDraftWorker:
             cache_lens[i] = self._cache_lens.get(req.rid, 0)
 
         sampling_info = self._build_greedy_sampling_info(bs)
+        sampling_info_base = self._build_sampling_info(batch.reqs)
         new_cache_chunks = [[] for _ in range(bs)]
 
         for _ in range(max_draft_tokens):
@@ -641,9 +664,33 @@ class PearlDraftWorker:
             if _PEARL_DRAFT_SYNC and torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
             logits = batch_result.logits_output.next_token_logits
+            sampling_info_active = sampling_info_base
+            if int(active_idx.numel()) != bs:
+                sampling_info_active = copy.deepcopy(sampling_info_base)
+                keep_indices_device = active_idx.to(self.device)
+                sampling_info_active.filter_batch(active_idx_cpu, keep_indices_device)
+            if sampling_info_active.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits, sampling_info_active, num_tokens_in_batch=1
+                )
+            if sampling_info_active.penalizer_orchestrator is not None or (
+                sampling_info_active.logit_bias is not None
+            ):
+                sampling_info_active.apply_logits_bias(logits)
             next_tokens = torch.argmax(logits, dim=-1)
+            temps = sampling_info_active.temperatures.view(-1).to(logits.device)
+            safe_temps = temps.clamp(min=1e-5)
+            probs = torch.softmax(logits.float() / safe_temps.unsqueeze(1), dim=-1)
+            next_token_probs = probs.gather(
+                1, next_tokens.unsqueeze(1)
+            ).squeeze(1)
+            next_token_probs = torch.where(
+                temps == 0, torch.ones_like(next_token_probs), next_token_probs
+            )
 
-            draft_tokens_tensor[active_idx, filled[active_idx]] = next_tokens
+            step_pos = filled.index_select(0, active_idx)
+            draft_tokens_tensor[active_idx, step_pos] = next_tokens
+            draft_probs_tensor[active_idx, step_pos] = next_token_probs
             filled[active_idx] += 1
             current_tokens[active_idx] = next_tokens
             cache_lens[active_idx] += 1
@@ -657,6 +704,8 @@ class PearlDraftWorker:
             rid = req.rid
             buffer = draft_tokens_tensor[i, : filled[i]].tolist()
             self._draft_buffers[rid] = buffer
+            prob_buffer = draft_probs_tensor[i, : filled[i]].tolist()
+            self._draft_prob_buffers[rid] = prob_buffer
             cached_indices = self._cache_indices.get(
                 rid, torch.empty((0,), dtype=torch.int64, device=self.device)
             )
@@ -665,7 +714,7 @@ class PearlDraftWorker:
             self._cache_indices[rid] = cached_indices
             self._cache_lens[rid] = int(cache_lens[i].item())
 
-        return draft_tokens_tensor
+        return draft_tokens_tensor, draft_probs_tensor
 
     def _run_draft_legacy(
         self,
@@ -676,6 +725,10 @@ class PearlDraftWorker:
         bs = batch.batch_size()
         buffers = {
             req.rid: list(self._draft_buffers.get(req.rid, [])) for req in batch.reqs
+        }
+        prob_buffers = {
+            req.rid: list(self._draft_prob_buffers.get(req.rid, []))
+            for req in batch.reqs
         }
         current_tokens = {}
         for req in batch.reqs:
@@ -797,11 +850,14 @@ class PearlDraftWorker:
             )
             logits = logits / temperatures.unsqueeze(1)
             next_tokens = torch.argmax(logits, dim=-1)
+            probs = torch.softmax(logits.float(), dim=-1)
+            next_token_probs = probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
 
             for idx, req_idx in enumerate(active):
                 rid = batch.reqs[req_idx].rid
                 token = int(next_tokens[idx].item())
                 buffers[rid].append(token)
+                prob_buffers[rid].append(float(next_token_probs[idx].item()))
                 current_tokens[rid] = token
                 cached_indices = self._cache_indices.get(
                     rid, torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -812,12 +868,19 @@ class PearlDraftWorker:
                 self._cache_lens[rid] = self._cache_lens.get(rid, 0) + 1
 
         draft_tokens = []
+        draft_probs = []
         for req in batch.reqs:
             buffer = buffers[req.rid]
+            prob_buffer = prob_buffers[req.rid]
             self._draft_buffers[req.rid] = buffer
+            self._draft_prob_buffers[req.rid] = prob_buffer
             draft_tokens.append(buffer[: self.speculative_num_draft_tokens])
+            draft_probs.append(prob_buffer[: self.speculative_num_draft_tokens])
 
-        return torch.tensor(draft_tokens, dtype=torch.int64, device=self.device)
+        return (
+            torch.tensor(draft_tokens, dtype=torch.int64, device=self.device),
+            torch.tensor(draft_probs, dtype=torch.float32, device=self.device),
+        )
 
     def run_draft(self, batch: ScheduleBatch):
         with self._lock:

@@ -344,6 +344,82 @@ class PearlWorker:
         )
         return torch.cat([tokens, pad], dim=1), valid_lens
 
+    def _pad_verify_probs(
+        self,
+        probs: Optional[torch.Tensor | list[torch.Tensor]],
+        draft_token_num: int,
+        valid_lens: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if probs is None:
+            return None
+        if isinstance(probs, list):
+            padded = []
+            for i, p in enumerate(probs):
+                if p is None:
+                    p = torch.empty((0,), dtype=torch.float32, device=self.device)
+                else:
+                    p = p.to(self.device).float()
+                max_len = draft_token_num
+                if valid_lens is not None and i < len(valid_lens):
+                    max_len = min(int(valid_lens[i].item()), draft_token_num)
+                if p.numel() > max_len:
+                    p = p[:max_len]
+                if p.numel() < draft_token_num:
+                    pad = torch.zeros(
+                        (draft_token_num - p.numel(),),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    p = torch.cat([p, pad], dim=0)
+                padded.append(p)
+            return torch.stack(padded, dim=0)
+
+        if probs.ndim == 1:
+            probs = probs.unsqueeze(0)
+        probs = probs.to(self.device).float()
+        cur = probs.shape[1]
+        if cur == draft_token_num:
+            return probs
+        if cur > draft_token_num:
+            return probs[:, :draft_token_num]
+        pad = torch.zeros(
+            (probs.shape[0], draft_token_num - cur),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return torch.cat([probs, pad], dim=1)
+
+    def _split_draft_result(
+        self, draft_result: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if isinstance(draft_result, tuple):
+            if len(draft_result) == 2:
+                return draft_result[0], draft_result[1]
+            return draft_result[0], None
+        return draft_result, None
+
+    def _normalize_draft_probs(
+        self, draft_probs: Optional[torch.Tensor], draft_tokens: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if draft_probs is None:
+            return None
+        if draft_probs.device != self.device:
+            draft_probs = draft_probs.to(self.device, non_blocking=True)
+        if draft_probs.dim() == 1:
+            draft_probs = draft_probs.view(draft_tokens.shape)
+        if draft_probs.shape[0] != draft_tokens.shape[0]:
+            return None
+        if draft_probs.shape[1] > draft_tokens.shape[1]:
+            draft_probs = draft_probs[:, : draft_tokens.shape[1]]
+        elif draft_probs.shape[1] < draft_tokens.shape[1]:
+            pad = torch.zeros(
+                (draft_probs.shape[0], draft_tokens.shape[1] - draft_probs.shape[1]),
+                dtype=draft_probs.dtype,
+                device=self.device,
+            )
+            draft_probs = torch.cat([draft_probs, pad], dim=1)
+        return draft_probs.float()
+
     def clear_cache_pool(self):
         # Allocator is shared with target worker.
         pass
@@ -653,9 +729,11 @@ class PearlWorker:
         indices: list[int],
         verify_tokens: torch.Tensor,
         out_cache_loc: torch.Tensor,
+        draft_probs: Optional[torch.Tensor] = None,
         prefix_logits: Optional[torch.Tensor] = None,
         prefix_logits_mask: Optional[torch.Tensor] = None,
         next_window_tokens: Optional[torch.Tensor] = None,
+        next_window_probs: Optional[torch.Tensor] = None,
         disable_cuda_graph: bool = False,
         draft_token_num: Optional[int] = None,
         valid_draft_lens: Optional[torch.Tensor] = None,
@@ -703,7 +781,9 @@ class PearlWorker:
             positions,
             token_num,
             self.target_vocab_size,
+            draft_probs=draft_probs,
             next_window_tokens=next_window_tokens,
+            next_window_probs=next_window_probs,
             prefix_logits=prefix_logits,
             prefix_logits_mask=prefix_logits_mask,
             valid_draft_lens=valid_draft_lens,
@@ -751,6 +831,8 @@ class PearlWorker:
         draft_start = time.perf_counter()
         draft_elapsed = None
         draft_future = self._draft_executor.submit(self.draft_worker.run_draft, batch)
+        draft_tokens = None
+        draft_probs = None
 
         post_indices = []
         pre_indices = []
@@ -795,23 +877,34 @@ class PearlWorker:
         ]
         logits_output = None
         can_run_cuda_graph = False
+        pre_stats_spec = None
 
+        verify_lens_full: Optional[list[int]] = None
         if allow_split:
             disable_cuda_graph = self._should_disable_cuda_graph()
+            verify_lens_full = [0 for _ in range(batch.batch_size())]
             verify_tokens = []
+            post_probs = []
             for idx in post_indices:
                 prev_window = batch.reqs[idx].pearl_prev_window
+                prev_probs = getattr(batch.reqs[idx], "pearl_prev_window_probs", None)
                 if prev_window is not None and prev_window.numel() > self.speculative_num_steps:
                     prev_window = prev_window[: self.speculative_num_steps]
+                    if prev_probs is not None:
+                        prev_probs = prev_probs[: self.speculative_num_steps]
                 verify_tokens.append(prev_window.to(self.device))
+                post_probs.append(prev_probs)
                 if _PEARL_DEBUG:
                     logger.info(
                         "PEARL verify window req=%s mode=post prev_window_len=%d",
                         batch.reqs[idx].rid,
                         prev_window.numel(),
                     )
-            verify_tokens, valid_lens = self._pad_verify_tokens(
+            verify_tokens, valid_lens_post = self._pad_verify_tokens(
                 verify_tokens, graph_token_num
+            )
+            post_probs = self._pad_verify_probs(
+                post_probs, graph_token_num, valid_lens=valid_lens_post
             )
             post_out_cache_loc = self._slice_out_cache_loc(
                 out_cache_loc, post_indices, graph_token_num
@@ -821,6 +914,7 @@ class PearlWorker:
                 post_indices,
                 verify_tokens,
                 post_out_cache_loc,
+                draft_probs=post_probs,
                 prefix_logits=(
                     prefix_logits[post_indices] if prefix_logits is not None else None
                 ),
@@ -831,13 +925,14 @@ class PearlWorker:
                 ),
                 disable_cuda_graph=disable_cuda_graph,
                 draft_token_num=graph_token_num,
-                valid_draft_lens=valid_lens,
+                valid_draft_lens=valid_lens_post,
             )
             if post_result is not None:
                 logits_output = post_result["logits_output"]
                 accept_length_list = post_result["accept_length_list"]
                 for local_idx, batch_idx in enumerate(post_indices):
                     accept_length_list_full[batch_idx] = accept_length_list[local_idx]
+                    verify_lens_full[batch_idx] = int(valid_lens_post[local_idx].item())
                 self._record_out_cache_segments(
                     out_cache_segments,
                     post_indices,
@@ -845,18 +940,32 @@ class PearlWorker:
                     accept_length_list,
                 )
 
-            draft_tokens = draft_future.result()
+            draft_tokens, draft_probs = self._split_draft_result(
+                draft_future.result()
+            )
             draft_elapsed = time.perf_counter() - draft_start
-            if self.target_vocab_size:
-                draft_tokens = torch.where(
-                    draft_tokens < self.target_vocab_size,
-                    draft_tokens,
-                    torch.zeros_like(draft_tokens),
-                )
             if draft_tokens.device != self.device:
                 draft_tokens = draft_tokens.to(self.device, non_blocking=True)
+            draft_probs = self._normalize_draft_probs(draft_probs, draft_tokens)
+            invalid_mask = draft_tokens < 0
+            if self.target_vocab_size:
+                invalid_mask |= draft_tokens >= self.target_vocab_size
+                draft_tokens = torch.where(
+                    invalid_mask, torch.zeros_like(draft_tokens), draft_tokens
+                )
+            if draft_probs is not None:
+                draft_probs = torch.where(
+                    invalid_mask, torch.zeros_like(draft_probs), draft_probs
+                )
 
-            pre_verify_tokens = draft_tokens[pre_indices]
+            pre_verify_tokens = []
+            for idx in pre_indices:
+                row = draft_tokens[idx]
+                valid_len = int((row >= 0).sum().item())
+                if valid_len > 0:
+                    pre_verify_tokens.append(row[:valid_len])
+                else:
+                    pre_verify_tokens.append(row[:0])
             if _PEARL_DEBUG:
                 for local_idx, idx in enumerate(pre_indices):
                     logger.info(
@@ -864,17 +973,25 @@ class PearlWorker:
                         batch.reqs[idx].rid,
                         pre_verify_tokens[local_idx].numel(),
                     )
-            pre_verify_tokens, valid_lens = self._pad_verify_tokens(
+            pre_verify_tokens, valid_lens_pre = self._pad_verify_tokens(
                 pre_verify_tokens, graph_token_num
             )
             pre_out_cache_loc = self._slice_out_cache_loc(
                 out_cache_loc, pre_indices, graph_token_num
             )
+            pre_draft_probs = None
+            if draft_probs is not None:
+                pre_draft_probs = self._pad_verify_probs(
+                    draft_probs[pre_indices],
+                    graph_token_num,
+                    valid_lens=valid_lens_pre,
+                )
             pre_result = self._verify_subset(
                 batch,
                 pre_indices,
                 pre_verify_tokens,
                 pre_out_cache_loc,
+                draft_probs=pre_draft_probs,
                 prefix_logits=(
                     prefix_logits[pre_indices] if prefix_logits is not None else None
                 ),
@@ -884,15 +1001,18 @@ class PearlWorker:
                     else None
                 ),
                 next_window_tokens=draft_tokens[pre_indices],
+                next_window_probs=pre_draft_probs,
                 disable_cuda_graph=disable_cuda_graph,
                 draft_token_num=graph_token_num,
-                valid_draft_lens=valid_lens,
+                valid_draft_lens=valid_lens_pre,
             )
             if pre_result is not None:
+                pre_stats_spec = pre_result["spec_info"]
                 logits_output = pre_result["logits_output"]
                 accept_length_list = pre_result["accept_length_list"]
                 for local_idx, batch_idx in enumerate(pre_indices):
                     accept_length_list_full[batch_idx] = accept_length_list[local_idx]
+                    verify_lens_full[batch_idx] = int(valid_lens_pre[local_idx].item())
                 self._record_out_cache_segments(
                     out_cache_segments,
                     pre_indices,
@@ -904,10 +1024,18 @@ class PearlWorker:
                 req = batch.reqs[idx]
                 if not getattr(req, "pre_verify", True) and not req.finished():
                     req.pearl_prev_window = draft_tokens[idx]
+                    if draft_probs is not None:
+                        req.pearl_prev_window_probs = draft_probs[idx]
+                    else:
+                        req.pearl_prev_window_probs = None
+                else:
+                    req.pearl_prev_window = None
+                    req.pearl_prev_window_probs = None
             can_run_cuda_graph = False
         else:
             post_verify_only = not pre_indices
             verify_tokens = []
+            verify_probs = []
             draft_tokens = None
             if post_verify_only:
                 for req in batch.reqs:
@@ -915,6 +1043,7 @@ class PearlWorker:
                     if prev_window is not None and prev_window.numel() > self.speculative_num_steps:
                         prev_window = prev_window[: self.speculative_num_steps]
                     verify_tokens.append(prev_window.to(self.device))
+                    verify_probs.append(getattr(req, "pearl_prev_window_probs", None))
                     if _PEARL_DEBUG:
                         logger.info(
                             "PEARL verify window req=%s mode=post prev_window_len=%d",
@@ -924,17 +1053,28 @@ class PearlWorker:
                 verify_tokens, valid_lens = self._pad_verify_tokens(
                     verify_tokens, graph_token_num
                 )
+                verify_probs = self._pad_verify_probs(
+                    verify_probs, graph_token_num, valid_lens=valid_lens
+                )
+                verify_lens_full = valid_lens.cpu().tolist()
             else:
-                draft_tokens = draft_future.result()
+                draft_tokens, draft_probs = self._split_draft_result(
+                    draft_future.result()
+                )
                 draft_elapsed = time.perf_counter() - draft_start
-                if self.target_vocab_size:
-                    draft_tokens = torch.where(
-                        draft_tokens < self.target_vocab_size,
-                        draft_tokens,
-                        torch.zeros_like(draft_tokens),
-                    )
                 if draft_tokens.device != self.device:
                     draft_tokens = draft_tokens.to(self.device, non_blocking=True)
+                draft_probs = self._normalize_draft_probs(draft_probs, draft_tokens)
+                invalid_mask = draft_tokens < 0
+                if self.target_vocab_size:
+                    invalid_mask |= draft_tokens >= self.target_vocab_size
+                    draft_tokens = torch.where(
+                        invalid_mask, torch.zeros_like(draft_tokens), draft_tokens
+                    )
+                if draft_probs is not None:
+                    draft_probs = torch.where(
+                        invalid_mask, torch.zeros_like(draft_probs), draft_probs
+                    )
 
                 for i, req in enumerate(batch.reqs):
                     prev_window = getattr(req, "pearl_prev_window", None)
@@ -942,6 +1082,9 @@ class PearlWorker:
                         if prev_window.numel() > self.speculative_num_steps:
                             prev_window = prev_window[: self.speculative_num_steps]
                         verify_tokens.append(prev_window.to(self.device))
+                        verify_probs.append(
+                            getattr(req, "pearl_prev_window_probs", None)
+                        )
                         if _PEARL_DEBUG:
                             logger.info(
                                 "PEARL verify window req=%s mode=post prev_window_len=%d",
@@ -949,21 +1092,37 @@ class PearlWorker:
                                 prev_window.numel(),
                             )
                     else:
-                        verify_tokens.append(draft_tokens[i])
+                        row = draft_tokens[i]
+                        valid_len = int((row >= 0).sum().item())
+                        if valid_len > 0:
+                            verify_tokens.append(row[:valid_len])
+                        else:
+                            verify_tokens.append(row[:0])
+                        if draft_probs is not None:
+                            verify_probs.append(draft_probs[i, :valid_len])
+                        else:
+                            verify_probs.append(None)
                         if _PEARL_DEBUG:
                             logger.info(
                                 "PEARL verify window req=%s mode=%s current_window_len=%d",
                                 req.rid,
                                 "pre" if getattr(req, "pre_verify", True) else "post",
-                                draft_tokens[i].numel(),
+                                verify_tokens[-1].numel(),
                             )
                 verify_tokens, valid_lens = self._pad_verify_tokens(
                     verify_tokens, graph_token_num
                 )
+                verify_probs = self._pad_verify_probs(
+                    verify_probs, graph_token_num, valid_lens=valid_lens
+                )
+                verify_lens_full = valid_lens.cpu().tolist()
 
             batch.out_cache_loc = out_cache_loc
             batch.input_ids = verify_tokens.reshape(-1)
             batch.disable_cuda_graph = self._should_disable_cuda_graph()
+            next_window_probs = None
+            if not post_verify_only and draft_probs is not None:
+                next_window_probs = draft_probs
             spec_info = PearlVerifyInput(
                 batch.input_ids,
                 self._build_custom_mask(
@@ -972,12 +1131,15 @@ class PearlWorker:
                 self._build_positions(batch, graph_token_num),
                 graph_token_num,
                 self.target_vocab_size,
+                draft_probs=verify_probs,
                 next_window_tokens=draft_tokens if not post_verify_only else None,
+                next_window_probs=next_window_probs,
                 prefix_logits=prefix_logits,
                 prefix_logits_mask=prefix_logits_mask,
                 valid_draft_lens=valid_lens,
             )
             batch.spec_info = spec_info
+            pre_stats_spec = spec_info
 
             model_worker_batch = batch.get_model_worker_batch()
             batch_result = self.target_worker.forward_batch_generation(
@@ -1003,19 +1165,30 @@ class PearlWorker:
             )
 
             if post_verify_only:
-                draft_tokens = draft_future.result()
+                draft_tokens, draft_probs = self._split_draft_result(
+                    draft_future.result()
+                )
                 draft_elapsed = time.perf_counter() - draft_start
-                if self.target_vocab_size:
-                    draft_tokens = torch.where(
-                        draft_tokens < self.target_vocab_size,
-                        draft_tokens,
-                        torch.zeros_like(draft_tokens),
-                    )
                 if draft_tokens.device != self.device:
                     draft_tokens = draft_tokens.to(self.device, non_blocking=True)
+                draft_probs = self._normalize_draft_probs(draft_probs, draft_tokens)
+                invalid_mask = draft_tokens < 0
+                if self.target_vocab_size:
+                    invalid_mask |= draft_tokens >= self.target_vocab_size
+                    draft_tokens = torch.where(
+                        invalid_mask, torch.zeros_like(draft_tokens), draft_tokens
+                    )
+                if draft_probs is not None:
+                    draft_probs = torch.where(
+                        invalid_mask, torch.zeros_like(draft_probs), draft_probs
+                    )
                 for i, req in enumerate(batch.reqs):
                     if not getattr(req, "pre_verify", True) and not req.finished():
                         req.pearl_prev_window = draft_tokens[i]
+                        if draft_probs is not None:
+                            req.pearl_prev_window_probs = draft_probs[i]
+                        else:
+                            req.pearl_prev_window_probs = None
 
         new_seq_lens_cpu = torch.tensor(
             [
@@ -1058,9 +1231,55 @@ class PearlWorker:
             self._update_adaptive_steps(extra_accept_rate)
             avg_accept = sum(accept_length_list_full) / len(accept_length_list_full)
             avg_accept_count = accept_count_sum / len(accept_length_list_full)
+            verify_lens = verify_lens_full or []
+            verify_avg = sum(verify_lens) / len(verify_lens) if verify_lens else 0.0
+            verify_min = min(verify_lens) if verify_lens else 0
+            verify_max = max(verify_lens) if verify_lens else 0
+            prev_lens = [
+                int(req.pearl_prev_window.numel())
+                if getattr(req, "pearl_prev_window", None) is not None
+                else 0
+                for req in batch.reqs
+            ]
+            prev_avg = sum(prev_lens) / len(prev_lens) if prev_lens else 0.0
+            revised_cnt = sum(
+                1 for req in batch.reqs if getattr(req, "pearl_used_revised", False)
+            )
+            reject_cnt = sum(
+                1
+                for req in batch.reqs
+                if getattr(req, "pearl_reject_pos", None) is not None
+            )
+            pre_count = 0
+            pre_accept = 0
+            pre_target_avg = 0.0
+            pre_draft_avg = 0.0
+            pre_accept_avg = 0.0
+            pre_zero = 0
+            if pre_stats_spec is not None:
+                pre_count = int(getattr(pre_stats_spec, "pre_verify_count", 0))
+                pre_accept = int(getattr(pre_stats_spec, "pre_verify_accept", 0))
+                pre_zero = int(getattr(pre_stats_spec, "pre_filtered_zero", 0))
+                if pre_count > 0:
+                    pre_target_avg = (
+                        float(getattr(pre_stats_spec, "pre_target_prob_sum", 0.0))
+                        / pre_count
+                    )
+                    pre_draft_avg = (
+                        float(getattr(pre_stats_spec, "pre_draft_prob_sum", 0.0))
+                        / pre_count
+                    )
+                    pre_accept_avg = (
+                        float(getattr(pre_stats_spec, "pre_accept_prob_sum", 0.0))
+                        / pre_count
+                    )
+            pre_accept_rate = pre_accept / pre_count if pre_count > 0 else 0.0
             logger.info(
                 "PEARL batch stats: bs=%d pre=%d post=%d steps=%d accept_rate=%.3f "
-                "extra_accept_rate=%.3f avg_accept=%.2f avg_accept_count=%.2f draft_ms=%.2f",
+                "extra_accept_rate=%.3f avg_accept=%.2f avg_accept_count=%.2f "
+                "verify_avg=%.2f verify_min=%d verify_max=%d prev_avg=%.2f "
+                "revised=%d reject=%d draft_ms=%.2f pre_accept=%.2f "
+                "pre_tprob=%.3f pre_dprob=%.3f pre_aprob=%.3f pre_zero=%d",
                 batch.batch_size(),
                 len(pre_indices),
                 len(post_indices),
@@ -1069,7 +1288,18 @@ class PearlWorker:
                 extra_accept_rate,
                 avg_accept,
                 avg_accept_count,
+                verify_avg,
+                verify_min,
+                verify_max,
+                prev_avg,
+                revised_cnt,
+                reject_cnt,
                 (draft_elapsed or 0.0) * 1000.0,
+                pre_accept_rate,
+                pre_target_avg,
+                pre_draft_avg,
+                pre_accept_avg,
+                pre_zero,
             )
 
         self._recompute_revised_kv(batch, spec_info_full)
