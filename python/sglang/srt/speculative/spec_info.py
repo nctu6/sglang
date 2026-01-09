@@ -173,6 +173,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
 
+    def is_dflash(self) -> bool:
+        return self._has_flag("DFLASH")
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None
@@ -189,6 +192,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "DFLASH": lambda algorithm: SpeculativeAlgorithm._add_flag("DFLASH", algorithm),
 }
 
 
@@ -284,6 +288,11 @@ def _create_ngram_worker(**kwargs: Any) -> Any:
 
     return NGRAMWorker(**kwargs)
 
+def _create_dflash_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+    return DFlashWorker(**kwargs)
+
 
 # Register built-in algorithms.
 # Third-party integrations should import `SpeculativeAlgorithm` and either
@@ -316,6 +325,12 @@ register_speculative_algorithm(
     flags=("NGRAM",),
 )
 
+register_speculative_algorithm(
+    "DFLASH",
+    worker_cls=_create_dflash_worker,
+    flags=("DFLASH",),
+)
+
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
@@ -323,6 +338,7 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    DFLASH_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -338,6 +354,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.DFLASH_VERIFY,
         }
 
     @abstractmethod

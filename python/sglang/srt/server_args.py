@@ -431,6 +431,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_dflash_mask_token_id: Optional[int] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2090,6 +2091,33 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "DFLASH":
+            if not self.device.startswith("cuda"):
+                raise ValueError(
+                    "DFlash speculative decoding only supports CUDA device."
+                )
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            if self.page_size != 1:
+                raise ValueError(
+                    "DFlash speculative decoding currently requires page_size=1."
+                )
+            if self.speculative_num_draft_tokens is None:
+                raise ValueError(
+                    "DFlash requires --speculative-num-draft-tokens (block size, including the prefix token)."
+                )
+            if self.speculative_num_draft_tokens < 2:
+                raise ValueError(
+                    "DFlash requires speculative_num_draft_tokens >= 2."
+                )
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3330,7 +3358,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "DFLASH"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3373,6 +3401,12 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-mask-token-id",
+            type=int,
+            help="Mask token id for DFlash draft model noise embeddings.",
+            default=ServerArgs.speculative_dflash_mask_token_id,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

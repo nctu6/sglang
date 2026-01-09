@@ -2363,6 +2363,7 @@ class ModelRunner:
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()
         ):
             return not self.is_draft_worker
 
@@ -2391,6 +2392,7 @@ class ModelRunner:
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -2533,6 +2535,17 @@ class ModelRunner:
                     draft_token_num=num_tokens_per_bs,
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+            elif self.spec_algorithm.is_dflash():
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                spec_info = DFlashVerifyInput(
+                    draft_token=torch.empty(
+                        (0,), dtype=torch.long, device=self.device
+                    ),
+                    positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+                    block_size=num_tokens_per_bs,
+                    custom_mask=buffers.custom_mask,
+                )
 
             return spec_info
 

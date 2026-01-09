@@ -666,6 +666,15 @@ class PiecewiseCudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            spec_info = DFlashVerifyInput(
+                draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+                positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+                block_size=num_tokens,
+                custom_mask=self.custom_mask,
+            )
 
         return spec_info
 
