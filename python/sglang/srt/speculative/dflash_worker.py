@@ -3,7 +3,8 @@ import logging
 from typing import Dict, Optional
 
 import torch
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -65,13 +66,58 @@ class DFlashWorker:
                 "states. Consider running with --disable-cuda-graph if you see issues."
             )
 
-        self.draft_model = AutoModel.from_pretrained(
-            server_args.speculative_draft_model_path,
+        draft_attn_impl = self._select_draft_attn_impl()
+        draft_model_kwargs = dict(
             revision=server_args.speculative_draft_model_revision,
             torch_dtype=self.model_runner.model_config.dtype,
             trust_remote_code=True,
-        ).to(self.device)
+        )
+        if draft_attn_impl is not None:
+            draft_model_kwargs["attn_implementation"] = draft_attn_impl
+        try:
+            self.draft_model = AutoModel.from_pretrained(
+                server_args.speculative_draft_model_path,
+                **draft_model_kwargs,
+            ).to(self.device)
+        except Exception as exc:
+            if "attn_implementation" in draft_model_kwargs:
+                logger.warning(
+                    "DFlash: draft model load failed with attn_implementation=%s: %s. Retrying without.",
+                    draft_attn_impl,
+                    exc,
+                )
+                draft_model_kwargs.pop("attn_implementation", None)
+                self.draft_model = AutoModel.from_pretrained(
+                    server_args.speculative_draft_model_path,
+                    **draft_model_kwargs,
+                ).to(self.device)
+            else:
+                raise
         self.draft_model.eval()
+        used_attn_impl = draft_model_kwargs.get("attn_implementation")
+        if used_attn_impl is not None:
+            logger.info("DFlash: draft attn_implementation=%s.", used_attn_impl)
+
+        self.draft_tokenizer = None
+        try:
+            self.draft_tokenizer = AutoTokenizer.from_pretrained(
+                server_args.speculative_draft_model_path,
+                revision=server_args.speculative_draft_model_revision,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            logger.debug("DFlash: failed to load draft tokenizer: %s", exc)
+            try:
+                self.draft_tokenizer = AutoTokenizer.from_pretrained(
+                    server_args.speculative_draft_model_path,
+                    revision=server_args.speculative_draft_model_revision,
+                    trust_remote_code=True,
+                    use_fast=False,
+                )
+            except Exception as exc2:
+                logger.debug(
+                    "DFlash: failed to load draft tokenizer (slow): %s", exc2
+                )
 
         try:
             draft_sig = inspect.signature(self.draft_model.forward)
@@ -87,6 +133,11 @@ class DFlashWorker:
                 "DFlash: draft model does not support noise_embedding/target_hidden; "
                 "falling back to input_ids-only draft generation."
             )
+        self._aux_capture_initialized = False
+        self._cuda_graph_recaptured = False
+        self.mask_token_id_out_of_vocab = False
+        self.mask_token_fallback_id: Optional[int] = None
+        self.mask_embedding: Optional[torch.Tensor] = None
 
         def normalize_token_id(value, label: str) -> Optional[int]:
             if value is None:
@@ -111,21 +162,88 @@ class DFlashWorker:
                 return int(value)
             return int(value)
 
+        def infer_mask_token_id(tokenizer, vocab_size: Optional[int] = None):
+            if tokenizer is None:
+                return None, None
+            known_tokens = ("<|MASK|>", "<|mask|>", "<mask>", "[MASK]", "<MASK>")
+            special_map = getattr(tokenizer, "special_tokens_map", None) or {}
+            candidates = []
+            mask_token = special_map.get("mask_token")
+            if mask_token:
+                candidates.append(mask_token)
+            additional = special_map.get("additional_special_tokens") or []
+            for token in additional:
+                if token in known_tokens:
+                    candidates.append(token)
+            candidates.extend(known_tokens)
+            for token in candidates:
+                token_id = tokenizer.convert_tokens_to_ids(token)
+                unk_id = getattr(tokenizer, "unk_token_id", None)
+                if token_id is not None and (unk_id is None or token_id != unk_id):
+                    if vocab_size is None or token_id < vocab_size:
+                        return token_id, token
+            if hasattr(tokenizer, "get_vocab"):
+                vocab = tokenizer.get_vocab()
+                for token in known_tokens:
+                    token_id = vocab.get(token)
+                    if token_id is not None:
+                        if vocab_size is None or token_id < vocab_size:
+                            return token_id, token
+            return None, None
+
         self.mask_token_id = server_args.speculative_dflash_mask_token_id
+        target_vocab_size = getattr(self.model_runner.model_config, "vocab_size", None)
         if self.mask_token_id is None:
             self.mask_token_id = getattr(self.draft_model.config, "mask_token_id", None)
             if self.mask_token_id is not None:
                 logger.info("DFlash: using draft model mask_token_id.")
         if self.mask_token_id is None:
+            if self.draft_tokenizer is not None:
+                self.mask_token_id = self.draft_tokenizer.mask_token_id
+                if self.mask_token_id is not None:
+                    logger.info("DFlash: using draft tokenizer mask_token_id.")
+        if self.mask_token_id is None:
+            inferred_id, inferred_token = infer_mask_token_id(
+                self.draft_tokenizer, target_vocab_size
+            )
+            if inferred_id is not None:
+                self.mask_token_id = inferred_id
+                logger.info(
+                    "DFlash: inferred mask token from draft tokenizer: %s.",
+                    inferred_token,
+                )
+        if self.mask_token_id is None:
             self.mask_token_id = target_worker.tokenizer.mask_token_id
             if self.mask_token_id is not None:
                 logger.info("DFlash: using target tokenizer mask_token_id.")
+        if self.mask_token_id is None:
+            inferred_id, inferred_token = infer_mask_token_id(
+                target_worker.tokenizer, target_vocab_size
+            )
+            if inferred_id is not None:
+                self.mask_token_id = inferred_id
+                logger.info(
+                    "DFlash: inferred mask token from target tokenizer: %s.",
+                    inferred_token,
+                )
+        if self.mask_token_id is None:
+            self._maybe_add_mask_token(target_worker)
+            target_vocab_size = getattr(
+                self.model_runner.model_config, "vocab_size", target_vocab_size
+            )
         if self.mask_token_id is None:
             self.mask_token_id = getattr(self.draft_model.config, "pad_token_id", None)
             if self.mask_token_id is not None:
                 logger.warning(
                     "DFlash: no mask token; using draft model pad_token_id as mask."
                 )
+        if self.mask_token_id is None:
+            if self.draft_tokenizer is not None:
+                self.mask_token_id = self.draft_tokenizer.pad_token_id
+                if self.mask_token_id is not None:
+                    logger.warning(
+                        "DFlash: no mask token; using draft tokenizer pad_token_id as mask."
+                    )
         if self.mask_token_id is None:
             self.mask_token_id = target_worker.tokenizer.pad_token_id
             if self.mask_token_id is not None:
@@ -139,12 +257,48 @@ class DFlashWorker:
                     "DFlash: no mask/pad token; using draft model eos_token_id as mask."
                 )
         if self.mask_token_id is None:
+            if self.draft_tokenizer is not None:
+                self.mask_token_id = self.draft_tokenizer.eos_token_id
+                if self.mask_token_id is not None:
+                    logger.warning(
+                        "DFlash: no mask/pad token; using draft tokenizer eos_token_id as mask."
+                    )
+        if self.mask_token_id is None:
             self.mask_token_id = target_worker.tokenizer.eos_token_id
             if self.mask_token_id is not None:
                 logger.warning(
                     "DFlash: no mask/pad token; using target tokenizer eos_token_id as mask."
                 )
         self.mask_token_id = normalize_token_id(self.mask_token_id, "mask_token_id")
+        if (
+            self.mask_token_id is not None
+            and target_vocab_size is not None
+            and self.mask_token_id >= target_vocab_size
+        ):
+            self.mask_token_id_out_of_vocab = True
+            self.mask_token_fallback_id = (
+                target_worker.tokenizer.eos_token_id
+                or target_worker.tokenizer.pad_token_id
+                or 0
+            )
+            self.mask_embedding = self._compute_mask_embedding()
+            logger.warning(
+                "DFlash: mask_token_id %d >= target vocab size %d; using fallback embedding.",
+                self.mask_token_id,
+                target_vocab_size,
+            )
+        if self.mask_token_id is None:
+            self.mask_token_id = target_worker.tokenizer.pad_token_id
+            if self.mask_token_id is not None:
+                logger.warning(
+                    "DFlash: no valid mask token; using target tokenizer pad_token_id as mask."
+                )
+        if self.mask_token_id is None:
+            self.mask_token_id = target_worker.tokenizer.eos_token_id
+            if self.mask_token_id is not None:
+                logger.warning(
+                    "DFlash: no valid mask/pad token; using target tokenizer eos_token_id as mask."
+                )
         if self.mask_token_id is None:
             raise ValueError(
                 "DFlash requires a mask token id. Set --speculative-dflash-mask-token-id."
@@ -163,14 +317,8 @@ class DFlashWorker:
             self.target_layer_ids = build_target_layer_ids(
                 num_target_layers, num_draft_layers
             )
-            if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
-                self.model_runner.model.set_eagle3_layers_to_capture(
-                    self.target_layer_ids
-                )
-            else:
-                raise ValueError(
-                    "Target model does not support capturing auxiliary hidden states."
-                )
+            self._ensure_target_aux_capture()
+            self._recapture_cuda_graph_if_needed()
             rotary_emb = getattr(self.draft_model, "rotary_emb", None)
             if rotary_emb is not None and hasattr(rotary_emb, "forward"):
                 orig_forward = rotary_emb.forward
@@ -196,9 +344,128 @@ class DFlashWorker:
         self.lm_head = self.model_runner.model.lm_head
 
         self.req_state: Dict[str, torch.Tensor] = {}
+        self.draft_cache: Dict[str, DynamicCache] = {}
 
     def clear_cache_pool(self):
         self.req_state.clear()
+        self.draft_cache.clear()
+
+    def _compute_mask_embedding(self) -> Optional[torch.Tensor]:
+        embed = self.embed_tokens
+        if not hasattr(embed, "weight"):
+            logger.warning(
+                "DFlash: cannot access embed_tokens weight; using zero mask embedding."
+            )
+            return torch.zeros(
+                embed.embedding_dim,
+                device=self.device,
+                dtype=self.model_runner.model_config.dtype,
+            )
+        weight = embed.weight
+        if hasattr(embed, "org_vocab_size"):
+            base_vocab = embed.org_vocab_size
+            if base_vocab > 0:
+                return weight[:base_vocab].mean(dim=0)
+        return weight.mean(dim=0)
+
+    def _build_noise_embedding(self, block_tokens: torch.Tensor) -> torch.Tensor:
+        if not self.mask_token_id_out_of_vocab:
+            return self.embed_tokens(block_tokens.unsqueeze(0))
+        safe_tokens = block_tokens.clone()
+        mask_positions = safe_tokens == self.mask_token_id
+        if mask_positions.any():
+            safe_tokens[mask_positions] = int(self.mask_token_fallback_id)
+        embeddings = self.embed_tokens(safe_tokens.unsqueeze(0))
+        if mask_positions.any():
+            embeddings = embeddings.clone()
+            embeddings[0, mask_positions] = self.mask_embedding
+        return embeddings
+
+    def _select_draft_attn_impl(self) -> Optional[str]:
+        backend = self.server_args.speculative_draft_attention_backend
+        if backend:
+            backend = backend.lower()
+            if backend in {"flash_attention_2", "flashattn2", "fa2"}:
+                return "flash_attention_2"
+            if backend in {"sdpa", "torch_sdpa"}:
+                return "sdpa"
+            if backend in {"eager", "torch"}:
+                return "eager"
+        try:
+            from transformers.utils.import_utils import is_flash_attn_2_available
+
+            if is_flash_attn_2_available():
+                return "flash_attention_2"
+        except Exception:
+            pass
+        return "sdpa"
+
+    def _maybe_add_mask_token(self, target_worker: TpModelWorker) -> None:
+        tokenizer = target_worker.tokenizer
+        if tokenizer is None:
+            return
+        if tokenizer.mask_token_id is not None:
+            self.mask_token_id = tokenizer.mask_token_id
+            logger.info("DFlash: using target tokenizer mask_token_id.")
+            return
+        try:
+            added = tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
+        except Exception as exc:
+            logger.warning("DFlash: failed to add mask token to tokenizer: %s", exc)
+            return
+        if tokenizer.mask_token_id is not None:
+            self.mask_token_id = tokenizer.mask_token_id
+            if added > 0:
+                logger.info(
+                    "DFlash: added mask token to target tokenizer: <|MASK|>."
+                )
+            else:
+                logger.info("DFlash: set mask token on target tokenizer: <|MASK|>.")
+
+    def _recapture_cuda_graph_if_needed(self) -> None:
+        if self._cuda_graph_recaptured:
+            return
+        if self.server_args.disable_cuda_graph:
+            return
+        if self.model_runner.device == "cpu":
+            return
+        if getattr(self.model_runner, "graph_runner", None) is None:
+            return
+        logger.info(
+            "DFlash: recapturing cuda graph after enabling aux hidden states."
+        )
+        self.model_runner.init_device_graphs()
+        self._cuda_graph_recaptured = True
+
+    def _ensure_target_aux_capture(self) -> None:
+        if not self.use_dflash_interface:
+            return
+        model = self.model_runner.model
+        if not hasattr(model, "set_eagle3_layers_to_capture"):
+            raise ValueError(
+                "Target model does not support capturing auxiliary hidden states."
+            )
+        expected_layers = [val + 1 for val in self.target_layer_ids]
+        if not getattr(model, "capture_aux_hidden_states", False):
+            model.set_eagle3_layers_to_capture(self.target_layer_ids)
+        if hasattr(model, "capture_aux_hidden_states"):
+            model.capture_aux_hidden_states = True
+        if (
+            hasattr(model, "model")
+            and hasattr(model.model, "layers_to_capture")
+            and model.model.layers_to_capture != expected_layers
+        ):
+            model.model.layers_to_capture = expected_layers
+        if not self._aux_capture_initialized:
+            self._aux_capture_initialized = True
+            logger.info(
+                "DFlash: target aux hidden capture enabled. layers_to_capture=%s",
+                getattr(
+                    getattr(model, "model", None),
+                    "layers_to_capture",
+                    None,
+                ),
+            )
 
     def _update_target_hidden_from_extend(
         self,
@@ -270,6 +537,9 @@ class DFlashWorker:
         for rid in list(self.req_state.keys()):
             if rid not in active_ids:
                 del self.req_state[rid]
+        for rid in list(self.draft_cache.keys()):
+            if rid not in active_ids:
+                del self.draft_cache[rid]
 
     def _normalize_target_hidden(
         self, hidden_states: torch.Tensor, label: str
@@ -363,7 +633,23 @@ class DFlashWorker:
                 block_tokens[0] = prefix_token
 
                 if self.use_dflash_interface:
-                    noise_embedding = self.embed_tokens(block_tokens.unsqueeze(0))
+                    expected_hidden_dim = (
+                        self.model_runner.model_config.hidden_size
+                        * len(self.target_layer_ids)
+                    )
+                    noise_embedding = self._build_noise_embedding(block_tokens)
+                    draft_cache = self.draft_cache.get(req.rid)
+                    if draft_cache is None:
+                        draft_cache = DynamicCache()
+                        self.draft_cache[req.rid] = draft_cache
+                    cache_len = (
+                        draft_cache.get_seq_length()
+                        if hasattr(draft_cache, "get_seq_length")
+                        else 0
+                    )
+                    if cache_len > seq_len and hasattr(draft_cache, "crop"):
+                        draft_cache.crop(seq_len)
+                        cache_len = seq_len
                     target_hidden = self.req_state.get(req.rid)
                     if target_hidden is None:
                         target_hidden = noise_embedding.new_zeros(
@@ -380,23 +666,27 @@ class DFlashWorker:
                         else:
                             target_hidden = target_hidden[:seq_len]
                         self.req_state[req.rid] = target_hidden
-                    expected_hidden_dim = (
-                        self.model_runner.model_config.hidden_size
-                        * len(self.target_layer_ids)
-                    )
                     if target_hidden.shape[-1] != expected_hidden_dim:
                         raise RuntimeError(
                             "DFlash target hidden states dimension mismatch."
                         )
+                    if cache_len < seq_len:
+                        target_hidden = target_hidden[cache_len:seq_len]
+                    else:
+                        target_hidden = target_hidden.new_zeros((0, expected_hidden_dim))
                     full_pos_ids = torch.arange(
-                        seq_len + self.block_size, device=device
+                        cache_len, seq_len + self.block_size, device=device
                     ).unsqueeze(0)
                     draft_output = self.draft_model(
                         position_ids=full_pos_ids,
                         noise_embedding=noise_embedding,
                         target_hidden=target_hidden.unsqueeze(0),
-                        use_cache=False,
+                        past_key_values=draft_cache,
+                        use_cache=True,
+                        is_causal=False,
                     )
+                    if hasattr(draft_cache, "crop"):
+                        draft_cache.crop(seq_len)
                 else:
                     draft_output = self.draft_model(
                         input_ids=block_tokens.unsqueeze(0),
@@ -419,6 +709,9 @@ class DFlashWorker:
         return draft_tokens.reshape(-1), positions.reshape(-1)
 
     def forward_batch_generation(self, batch: ScheduleBatch):
+        if self.use_dflash_interface:
+            self._ensure_target_aux_capture()
+            self._recapture_cuda_graph_if_needed()
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = batch.get_model_worker_batch()
             model_worker_batch.capture_hidden_mode = (
