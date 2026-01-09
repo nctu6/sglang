@@ -2531,6 +2531,15 @@ def get_rope(
 
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+    if _is_cuda or _is_hip:
+        device_key = ("cuda", torch.cuda.current_device())
+    elif _is_xpu and hasattr(torch, "xpu"):
+        device_key = ("xpu", torch.xpu.current_device())
+    elif _is_npu and hasattr(torch, "npu"):
+        device_key = ("npu", torch.npu.current_device())
+    else:
+        device_key = ("cpu", None)
+
     key = (
         head_size,
         rotary_dim,
@@ -2540,6 +2549,7 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
+        device_key,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
