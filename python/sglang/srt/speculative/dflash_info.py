@@ -18,6 +18,22 @@ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool
 logger = logging.getLogger(__name__)
 
 
+class DFlashDraftInput(SpecInput):
+    def __init__(
+        self,
+        positions: torch.Tensor,
+        target_hidden: torch.Tensor,
+        target_lens: torch.Tensor,
+    ):
+        super().__init__(SpecInputType.DFLASH_DRAFT)
+        self.positions = positions
+        self.target_hidden = target_hidden
+        self.target_lens = target_lens
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return 1, 1
+
+
 class DFlashVerifyInput(SpecInput):
     def __init__(
         self,

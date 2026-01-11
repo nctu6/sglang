@@ -1,3 +1,4 @@
+import copy
 import inspect
 import logging
 from typing import Dict, Optional
@@ -7,13 +8,24 @@ from transformers import AutoModel, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import empty_context
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +66,8 @@ class DFlashWorker:
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.embed_tokens = self.model_runner.model.get_input_embeddings()
+        self.lm_head = self.model_runner.model.lm_head
 
         if server_args.speculative_draft_model_path is None:
             raise ValueError("DFlash requires --speculative-draft-model-path.")
@@ -68,73 +82,94 @@ class DFlashWorker:
                 "states. Consider running with --disable-cuda-graph if you see issues."
             )
 
-        draft_attn_impl = self._select_draft_attn_impl()
-        draft_model_kwargs = dict(
-            revision=server_args.speculative_draft_model_revision,
-            torch_dtype=self.model_runner.model_config.dtype,
-            trust_remote_code=True,
-        )
-        if draft_attn_impl is not None:
-            draft_model_kwargs["attn_implementation"] = draft_attn_impl
-        try:
-            self.draft_model = AutoModel.from_pretrained(
-                server_args.speculative_draft_model_path,
-                **draft_model_kwargs,
-            ).to(self.device)
-        except Exception as exc:
-            if "attn_implementation" in draft_model_kwargs:
-                logger.warning(
-                    "DFlash: draft model load failed with attn_implementation=%s: %s. Retrying without.",
-                    draft_attn_impl,
-                    exc,
-                )
-                draft_model_kwargs.pop("attn_implementation", None)
+        self.draft_tokenizer = None
+        self.draft_worker: Optional[TpModelWorker] = None
+        self.draft_runner = None
+        self.draft_req_to_token_pool: Optional[ReqToTokenPool] = None
+        self.draft_token_to_kv_pool_allocator = None
+        self.draft_req_pool_indices: Dict[str, int] = {}
+        self.use_sglang_draft = False
+
+        if self._init_sglang_draft_worker(
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            moe_ep_rank=moe_ep_rank,
+            nccl_port=nccl_port,
+        ):
+            self.use_sglang_draft = True
+            self.use_dflash_interface = True
+            self.draft_model = self.draft_runner.model
+            self.draft_model.eval()
+        else:
+            draft_attn_impl = self._select_draft_attn_impl()
+            draft_model_kwargs = dict(
+                revision=server_args.speculative_draft_model_revision,
+                torch_dtype=self.model_runner.model_config.dtype,
+                trust_remote_code=True,
+            )
+            if draft_attn_impl is not None:
+                draft_model_kwargs["attn_implementation"] = draft_attn_impl
+            try:
                 self.draft_model = AutoModel.from_pretrained(
                     server_args.speculative_draft_model_path,
                     **draft_model_kwargs,
                 ).to(self.device)
-            else:
-                raise
-        self.draft_model.eval()
-        used_attn_impl = getattr(self.draft_model.config, "_attn_implementation", None)
-        if used_attn_impl:
-            logger.info("DFlash: draft attn_implementation=%s.", used_attn_impl)
-
-        self.draft_tokenizer = None
-        try:
-            self.draft_tokenizer = AutoTokenizer.from_pretrained(
-                server_args.speculative_draft_model_path,
-                revision=server_args.speculative_draft_model_revision,
-                trust_remote_code=True,
+            except Exception as exc:
+                if "attn_implementation" in draft_model_kwargs:
+                    logger.warning(
+                        "DFlash: draft model load failed with attn_implementation=%s: %s. Retrying without.",
+                        draft_attn_impl,
+                        exc,
+                    )
+                    draft_model_kwargs.pop("attn_implementation", None)
+                    self.draft_model = AutoModel.from_pretrained(
+                        server_args.speculative_draft_model_path,
+                        **draft_model_kwargs,
+                    ).to(self.device)
+                else:
+                    raise
+            self.draft_model.eval()
+            used_attn_impl = getattr(
+                self.draft_model.config, "_attn_implementation", None
             )
-        except Exception as exc:
-            logger.debug("DFlash: failed to load draft tokenizer: %s", exc)
+            if used_attn_impl:
+                logger.info("DFlash: draft attn_implementation=%s.", used_attn_impl)
+
             try:
                 self.draft_tokenizer = AutoTokenizer.from_pretrained(
                     server_args.speculative_draft_model_path,
                     revision=server_args.speculative_draft_model_revision,
                     trust_remote_code=True,
-                    use_fast=False,
                 )
-            except Exception as exc2:
-                logger.debug(
-                    "DFlash: failed to load draft tokenizer (slow): %s", exc2
+            except Exception as exc:
+                logger.debug("DFlash: failed to load draft tokenizer: %s", exc)
+                try:
+                    self.draft_tokenizer = AutoTokenizer.from_pretrained(
+                        server_args.speculative_draft_model_path,
+                        revision=server_args.speculative_draft_model_revision,
+                        trust_remote_code=True,
+                        use_fast=False,
+                    )
+                except Exception as exc2:
+                    logger.debug(
+                        "DFlash: failed to load draft tokenizer (slow): %s", exc2
+                    )
+
+            try:
+                draft_sig = inspect.signature(self.draft_model.forward)
+                draft_params = draft_sig.parameters
+                self.use_dflash_interface = (
+                    "noise_embedding" in draft_params and "target_hidden" in draft_params
                 )
+            except (TypeError, ValueError):
+                self.use_dflash_interface = False
 
-        try:
-            draft_sig = inspect.signature(self.draft_model.forward)
-            draft_params = draft_sig.parameters
-            self.use_dflash_interface = (
-                "noise_embedding" in draft_params and "target_hidden" in draft_params
-            )
-        except (TypeError, ValueError):
-            self.use_dflash_interface = False
-
-        if not self.use_dflash_interface:
-            logger.warning(
-                "DFlash: draft model does not support noise_embedding/target_hidden; "
-                "falling back to input_ids-only draft generation."
-            )
+            if not self.use_dflash_interface:
+                logger.warning(
+                    "DFlash: draft model does not support noise_embedding/target_hidden; "
+                    "falling back to input_ids-only draft generation."
+                )
         self._aux_capture_initialized = False
         self._cuda_graph_recaptured = False
         self._hidden_dim_mismatch_seen = False
@@ -383,15 +418,17 @@ class DFlashWorker:
         else:
             self.target_layer_ids = []
 
-        self.embed_tokens = self.model_runner.model.get_input_embeddings()
-        self.lm_head = self.model_runner.model.lm_head
-
         self.req_state: Dict[str, torch.Tensor] = {}
         self.draft_cache: Dict[str, DynamicCache] = {}
 
     def clear_cache_pool(self):
         self.req_state.clear()
         self.draft_cache.clear()
+        if self.draft_req_to_token_pool is not None and self.draft_req_pool_indices:
+            self.draft_req_to_token_pool.free(
+                list(self.draft_req_pool_indices.values())
+            )
+        self.draft_req_pool_indices.clear()
 
     def _compute_mask_embedding(self) -> Optional[torch.Tensor]:
         embed = self.embed_tokens
@@ -423,6 +460,17 @@ class DFlashWorker:
             embeddings = embeddings.clone()
             embeddings[0, mask_positions] = self.mask_embedding
         return embeddings
+
+    def _build_dflash_input_ids(
+        self,
+        mem_len: int,
+        seq_len: int,
+        block_tokens: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        input_ids = torch.zeros(mem_len, dtype=torch.long, device=device)
+        input_ids[seq_len:] = block_tokens
+        return input_ids
 
     def _select_draft_attn_impl(self) -> Optional[str]:
         backend = self.server_args.speculative_draft_attention_backend
@@ -460,6 +508,92 @@ class DFlashWorker:
             "auto, flash_attention_2, sdpa, eager, fa2/flashattn2, "
             "or one of fa3/flashinfer/triton (mapped to HF default)."
         )
+
+    def _init_sglang_draft_worker(
+        self,
+        gpu_id: int,
+        tp_rank: int,
+        dp_rank: Optional[int],
+        moe_ep_rank: int,
+        nccl_port: int,
+    ) -> bool:
+        try:
+            draft_args = copy.deepcopy(self.server_args)
+            draft_args.disable_cuda_graph = True
+            draft_args.skip_tokenizer_init = True
+            draft_args.speculative_draft_model_path = (
+                self.server_args.speculative_draft_model_path
+            )
+            draft_args.speculative_draft_model_revision = (
+                self.server_args.speculative_draft_model_revision
+            )
+
+            draft_req_to_token_pool = self.target_worker.get_memory_pool()[0]
+            if isinstance(draft_req_to_token_pool, ReqToTokenPool):
+                draft_req_to_token_pool = ReqToTokenPool(
+                    size=draft_req_to_token_pool.size,
+                    max_context_len=draft_req_to_token_pool.max_context_len,
+                    device=draft_req_to_token_pool.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
+            else:
+                logger.warning(
+                    "DFlash: draft req_to_token_pool is not a plain ReqToTokenPool; using shared pool."
+                )
+
+            token_to_kv_pool_allocator = self.target_worker.get_memory_pool()[1]
+
+            with (
+                empty_context(),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                draft_worker = TpModelWorker(
+                    server_args=draft_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    pp_rank=0,
+                    dp_rank=dp_rank,
+                    moe_ep_rank=moe_ep_rank,
+                    nccl_port=nccl_port,
+                    is_draft_worker=True,
+                    req_to_token_pool=draft_req_to_token_pool,
+                    token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                )
+
+            self.draft_worker = draft_worker
+            self.draft_runner = draft_worker.model_runner
+            self.draft_req_to_token_pool = draft_req_to_token_pool
+            self.draft_token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+            if self.draft_runner.model.__class__.__name__ != "DFlashDraftModel":
+                logger.warning(
+                    "DFlash: draft model architecture %s is not DFlashDraftModel; falling back to HF draft.",
+                    self.draft_runner.model.__class__.__name__,
+                )
+                self.draft_worker = None
+                self.draft_runner = None
+                self.draft_req_to_token_pool = None
+                self.draft_token_to_kv_pool_allocator = None
+                return False
+
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+            if hasattr(self.draft_runner.model, "set_embed_and_head"):
+                self.draft_runner.model.set_embed_and_head(embed, head)
+            elif hasattr(self.draft_runner.model, "set_embed"):
+                self.draft_runner.model.set_embed(embed)
+
+            if self.server_args.speculative_draft_attention_backend:
+                logger.info(
+                    "DFlash: draft attention backend=%s.",
+                    self.server_args.speculative_draft_attention_backend,
+                )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "DFlash: failed to initialize SGLang draft runner: %s", exc
+            )
+            return False
 
     def _maybe_add_mask_token(self, target_worker: TpModelWorker) -> None:
         tokenizer = target_worker.tokenizer
@@ -618,6 +752,11 @@ class DFlashWorker:
         for rid in list(self.draft_cache.keys()):
             if rid not in active_ids:
                 del self.draft_cache[rid]
+        for rid in list(self.draft_req_pool_indices.keys()):
+            if rid not in active_ids:
+                idx = self.draft_req_pool_indices.pop(rid)
+                if self.draft_req_to_token_pool is not None:
+                    self.draft_req_to_token_pool.free(idx)
 
     def _normalize_target_hidden(
         self, hidden_states: torch.Tensor, label: str
@@ -693,6 +832,9 @@ class DFlashWorker:
         return lm_head(hidden_states)
 
     def _generate_draft_tokens(self, batch: ScheduleBatch):
+        if self.use_sglang_draft:
+            return self._generate_draft_tokens_sglang(batch)
+
         bs = batch.batch_size()
         device = batch.seq_lens.device
         draft_tokens = torch.empty(
@@ -709,7 +851,12 @@ class DFlashWorker:
                 else:
                     prefix_token = req.origin_input_ids[-1]
 
-                seq_len = int(batch.seq_lens_cpu[i])
+                seq_lens_cpu = (
+                    batch.seq_lens_cpu
+                    if batch.seq_lens_cpu is not None
+                    else batch.seq_lens.cpu()
+                )
+                seq_len = int(seq_lens_cpu[i])
                 pos_ids = torch.arange(
                     seq_len, seq_len + self.block_size, device=device
                 ).unsqueeze(0)
@@ -796,6 +943,154 @@ class DFlashWorker:
 
                 draft_tokens[i, 0] = prefix_token
                 draft_tokens[i, 1:] = draft_sample.squeeze(0)
+
+        return draft_tokens.reshape(-1), positions.reshape(-1)
+
+    def _generate_draft_tokens_sglang(self, batch: ScheduleBatch):
+        bs = batch.batch_size()
+        device = batch.seq_lens.device
+        draft_tokens = torch.empty(
+            (bs, self.block_size), dtype=torch.long, device=device
+        )
+        positions = torch.empty(
+            (bs, self.block_size), dtype=torch.long, device=device
+        )
+
+        with torch.inference_mode():
+            for i, req in enumerate(batch.reqs):
+                if req.output_ids:
+                    prefix_token = req.output_ids[-1]
+                else:
+                    prefix_token = req.origin_input_ids[-1]
+
+                seq_len = int(batch.seq_lens_cpu[i])
+                pos_ids = torch.arange(
+                    seq_len, seq_len + self.block_size, device=device
+                )
+                positions[i] = pos_ids
+
+                block_tokens = torch.full(
+                    (self.block_size,),
+                    self.mask_token_id,
+                    device=device,
+                    dtype=torch.long,
+                )
+                block_tokens[0] = prefix_token
+
+                expected_hidden_dim = (
+                    self.model_runner.model_config.hidden_size
+                    * len(self.target_layer_ids)
+                )
+                target_hidden = self.req_state.get(req.rid)
+                if target_hidden is None:
+                    target_hidden = torch.zeros(
+                        (seq_len, expected_hidden_dim),
+                        device=device,
+                        dtype=self.model_runner.model_config.dtype,
+                    )
+                    self.req_state[req.rid] = target_hidden
+                if target_hidden.shape[0] != seq_len:
+                    if target_hidden.shape[0] < seq_len:
+                        pad_len = seq_len - target_hidden.shape[0]
+                        pad = target_hidden.new_zeros(
+                            (pad_len, target_hidden.shape[-1])
+                        )
+                        target_hidden = torch.cat((target_hidden, pad), dim=0)
+                    else:
+                        target_hidden = target_hidden[:seq_len]
+                    self.req_state[req.rid] = target_hidden
+                if target_hidden.shape[-1] != expected_hidden_dim:
+                    raise RuntimeError("DFlash target hidden states dimension mismatch.")
+
+                mem_len = seq_len + self.block_size
+                mem_positions = torch.arange(mem_len, device=device, dtype=torch.long)
+                noise_embedding = self._build_noise_embedding(block_tokens).squeeze(0)
+                target_placeholder = noise_embedding.new_zeros(
+                    (seq_len, noise_embedding.shape[-1])
+                )
+                input_embeds = torch.cat((target_placeholder, noise_embedding), dim=0)
+                if batch.tree_cache is not None:
+                    out_cache_loc = alloc_token_slots(batch.tree_cache, mem_len)
+                else:
+                    out_cache_loc = self.draft_token_to_kv_pool_allocator.alloc(mem_len)
+                    if out_cache_loc is None:
+                        raise RuntimeError("DFlash draft KV cache allocation failed.")
+
+                draft_pool_idx = self.draft_req_pool_indices.get(req.rid)
+                if draft_pool_idx is None:
+                    pool = self.draft_req_to_token_pool
+                    if pool is None:
+                        raise RuntimeError("DFlash draft req_to_token_pool is not set.")
+                    alloc = pool.alloc(1)
+                    if alloc is None:
+                        raise RuntimeError(
+                            "DFlash draft req_to_token_pool is full."
+                        )
+                    draft_pool_idx = alloc[0]
+                    self.draft_req_pool_indices[req.rid] = draft_pool_idx
+
+                token_pool = self.draft_req_to_token_pool.req_to_token
+                token_pool[draft_pool_idx, :mem_len] = out_cache_loc.to(
+                    token_pool.dtype
+                )
+
+                seq_lens = torch.tensor(
+                    [mem_len], dtype=batch.seq_lens.dtype, device=device
+                )
+                seq_lens_cpu_dtype = (
+                    batch.seq_lens_cpu.dtype
+                    if batch.seq_lens_cpu is not None
+                    else torch.int32
+                )
+                seq_lens_cpu = torch.tensor([mem_len], dtype=seq_lens_cpu_dtype)
+                req_pool_indices = torch.tensor(
+                    [draft_pool_idx], dtype=batch.req_pool_indices.dtype, device=device
+                )
+                forward_batch = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=self._build_dflash_input_ids(
+                        mem_len, seq_len, block_tokens, device
+                    ),
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    out_cache_loc=out_cache_loc,
+                    seq_lens_sum=mem_len,
+                )
+                forward_batch.seq_lens_cpu = seq_lens_cpu
+                forward_batch.positions = mem_positions
+                forward_batch.extend_num_tokens = mem_len
+                forward_batch.extend_seq_lens = seq_lens
+                forward_batch.extend_prefix_lens = torch.zeros_like(seq_lens)
+                forward_batch.extend_seq_lens_cpu = [mem_len]
+                forward_batch.extend_prefix_lens_cpu = [0]
+                forward_batch.req_to_token_pool = self.draft_runner.req_to_token_pool
+                forward_batch.token_to_kv_pool = self.draft_runner.token_to_kv_pool
+                forward_batch.attn_backend = self.draft_runner.attn_backend
+                forward_batch.spec_algorithm = SpeculativeAlgorithm.DFLASH
+                forward_batch.spec_info = DFlashDraftInput(
+                    positions=mem_positions,
+                    target_hidden=target_hidden,
+                    target_lens=torch.tensor([seq_len], device=device),
+                )
+                forward_batch.input_embeds = input_embeds
+
+                self.draft_runner.attn_backend.init_forward_metadata(forward_batch)
+                hidden = self.draft_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    input_embeds=forward_batch.input_embeds,
+                )
+
+                if hasattr(self.draft_token_to_kv_pool_allocator, "free"):
+                    self.draft_token_to_kv_pool_allocator.free(out_cache_loc)
+
+                draft_logits = self._compute_draft_logits(hidden[1:, :])
+                draft_sample = torch.argmax(draft_logits, dim=-1)
+
+                draft_tokens[i, 0] = prefix_token
+                draft_tokens[i, 1:] = draft_sample
 
         return draft_tokens.reshape(-1), positions.reshape(-1)
 

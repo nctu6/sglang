@@ -338,6 +338,7 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
 
 
@@ -348,7 +349,10 @@ class SpecInput(ABC):
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
         # or use another variable name like `draft_input` to substitute `spec_info`
-        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_DRAFT,
+            SpecInputType.DFLASH_DRAFT,
+        }
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
