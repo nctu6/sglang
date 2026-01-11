@@ -322,6 +322,7 @@ class Qwen2Model(nn.Module):
 
         # For EAGLE3 support
         self.layers_to_capture = []
+        self.capture_aux_hidden_states_post_layer = False
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -353,8 +354,9 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        capture_post_layer = self.capture_aux_hidden_states_post_layer
         for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
+            if i in self.layers_to_capture and not capture_post_layer:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
@@ -365,6 +367,10 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            if i in self.layers_to_capture and capture_post_layer:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
