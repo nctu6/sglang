@@ -345,6 +345,8 @@ class SchedulerOutputProcessorMixin:
 
         req.jacobi_draft_ids = draft_ids
         req.jacobi_needs_bootstrap = False
+        # Only cache committed tokens; drafts are speculative and should not occupy KV cache.
+        req.fill_ids = req.origin_input_ids + req.output_ids
 
         page_size = get_global_server_args().page_size
         prefix_len = batch.prefix_lens[0]

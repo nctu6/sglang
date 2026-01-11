@@ -330,6 +330,7 @@ def alloc_req_slots(
 
 def alloc_for_extend(
     batch: ScheduleBatch,
+    reuse_req_pool_indices: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
@@ -355,10 +356,18 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
-    req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
-    )
+    # Allocate req slots unless caller provides existing indices to reuse.
+    if reuse_req_pool_indices is None:
+        req_pool_indices = alloc_req_slots(
+            batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+        )
+    else:
+        req_pool_indices = reuse_req_pool_indices
+        if len(req_pool_indices) != bs:
+            raise ValueError(
+                "reuse_req_pool_indices length mismatch: "
+                f"{len(req_pool_indices)=}, {bs=}"
+            )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 

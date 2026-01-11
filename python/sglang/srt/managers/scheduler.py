@@ -274,6 +274,9 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        if getattr(self.spec_algorithm, "name", None) == "JACOBI" and self.enable_overlap:
+            logger.info("Disabling overlap scheduler for Jacobi speculative decoding.")
+            self.enable_overlap = False
         self.jacobi_rr_idx = 0
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
@@ -2162,7 +2165,11 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
+            if (
+                self.spec_algorithm.is_none()
+                or self.enable_overlap
+                or getattr(self.spec_algorithm, "name", None) == "JACOBI"
+            ):
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:

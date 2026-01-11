@@ -1444,8 +1444,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
+        reuse_req_pool_indices = None
+        if self.is_jacobi:
+            can_reuse = True
+            reuse_req_pool_indices = []
+            for req in reqs:
+                if req.req_pool_idx is None or req.is_retracted or req.kv_committed_freed:
+                    can_reuse = False
+                    break
+                reuse_req_pool_indices.append(req.req_pool_idx)
+            if not can_reuse:
+                reuse_req_pool_indices = None
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
+            self, reuse_req_pool_indices=reuse_req_pool_indices
         )
 
         # Set fields
